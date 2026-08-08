@@ -2,7 +2,7 @@
 name = "comfyui-h3-powerlorastack"
 description = "Stacked multi-LoRA loader for MiniMax H3 across bf16, fp8, int8 and w4a8 weights."
 version = "1.0.0"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 dependencies = []
 
 [project.urls]

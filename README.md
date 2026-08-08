@@ -265,3 +265,7 @@ auto-balance would have used.
   handle and its own LoRA path.
 - DoRA, LoHa, LoKr and locon adapters always merge — only plain rank
   decompositions can be branched.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
