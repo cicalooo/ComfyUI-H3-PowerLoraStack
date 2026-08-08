@@ -3,6 +3,9 @@
 A stacked multi-LoRA loader for **MiniMax H3**, in the spirit of rgthree's Power
 Lora Loader but built around the three things that actually break H3 LoRAs.
 
+<img width="1426" height="642" alt="image" src="https://github.com/user-attachments/assets/522e8637-d82e-4753-92e1-f0543f9f5525" />
+
+
 ## Nodes
 
 | Node | Purpose |
