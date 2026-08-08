@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-h3-powerlorastack"
+description = "Stacked multi-LoRA loader for MiniMax H3 across bf16, fp8, int8 and w4a8 weights."
+version = "1.0.0"
+license = { text = "MIT" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/doggeddalle/ComfyUI-H3-PowerLoraStack"
+
+[tool.comfy]
+PublisherId = "doggeddalle"
+DisplayName = "MiniMax H3 Power LoRA Stack"
+Icon = ""
