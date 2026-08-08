@@ -9,6 +9,13 @@ const BALANCE_ROUTE = "/h3_power_lora_stack/balance";
 const BALANCE_LABEL = "⚖ Auto-balance strengths";
 const RESTORE_LABEL = "↺ Restore manual strengths";
 
+// Layout of the serialized widgets_values array.  Format 1 ended with one slot
+// per button; format 2 marks the buttons serialize:false and stops at the rows.
+// Stamped into node.properties so a reload can tell the two apart.
+const ROW_FORMAT_KEY = "h3RowFormat";
+const ROW_FORMAT = 2;
+const LEGACY_BUTTON_SLOTS = 3;
+
 // Session cache for the loras folder listing.  Deliberately a module global
 // rather than graph.extra: anything hung off the graph is serialized into the
 // saved workflow, which would bake a stale copy of the whole folder into every
@@ -483,6 +490,11 @@ function loraWidgets(node) {
   return (node.widgets || []).filter((w) => w.type === "H3_LORA");
 }
 
+/** Shape test for a serialized stack row, as it appears in widgets_values. */
+function isRowValue(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v) && "lora" in v;
+}
+
 /* --------------------------------------------------------------- balance -- */
 
 function activeRows(node) {
@@ -596,7 +608,7 @@ function addLoraWidget(node, value) {
   const widget = makeLoraWidget(node, `lora_${loraWidgets(node).length + 1}`, value);
   node.widgets = node.widgets || [];
   // keep the "Add LoRA" button last
-  const buttonIndex = node.widgets.findIndex((w) => w.name === "➕ Add LoRA");
+  const buttonIndex = node.widgets.findIndex((w) => w.h3Role === "add");
   if (buttonIndex >= 0) node.widgets.splice(buttonIndex, 0, widget);
   else node.widgets.push(widget);
   renumber(node);
@@ -630,15 +642,18 @@ app.registerExtension({
     nodeType.prototype.onNodeCreated = function () {
       onCreated?.apply(this, arguments);
       this.serialize_widgets = true;
+      this.properties = this.properties || {};
+      this.properties[ROW_FORMAT_KEY] = ROW_FORMAT;
 
       // (value, canvas, node, pos, event) -- the event is the pointerdown that
       // started the click, so the picker opens right under the button.
-      this.addWidget("button", "➕ Add LoRA", null, (_v, _canvas, _node, _pos, event) => {
+      const add = this.addWidget("button", "➕ Add LoRA", null, (_v, _canvas, _node, _pos, event) => {
         const widget = addLoraWidget(this);
         // open the picker immediately: the row is added to be filled in, so the
         // filter box takes the keyboard straight away
         showLoraMenu(this, widget, event, { removeOnCancel: true });
       });
+      add.h3Role = "add";
 
       const balance = this.addWidget("button", BALANCE_LABEL, null, () => {
         applyBalance(this, { force: true });
@@ -652,6 +667,15 @@ app.registerExtension({
       });
       restore.h3Role = "restore";
 
+      // The buttons hold no state, and leaving them in widgets_values is what
+      // made the stack grow: LiteGraph restores that array positionally over
+      // the widgets that exist before onConfigure runs -- the two combos and
+      // these three buttons -- so the first three saved rows landed in the
+      // buttons' `value`, were written back out on the next save, and came
+      // home as three extra rows on every load or clone.  Opting out of
+      // serialization drops them from both halves of that round trip.
+      for (const button of [add, balance, restore]) button.serialize = false;
+
       fetchLoraList();   // warm the cache so the first picker opens instantly
       resize(this);
     };
@@ -660,14 +684,23 @@ app.registerExtension({
     nodeType.prototype.onConfigure = function (info) {
       onConfigure?.apply(this, arguments);
       // ComfyUI restores widgets_values positionally against the widgets that
-      // existed before this ran, which is only the fixed combos and the button.
-      // The stack rows are recovered by shape instead of position, so a slot
-      // shifting cannot corrupt them.
+      // existed before this ran, which is only the fixed combos and the
+      // buttons.  The stack rows are recovered by shape instead of position,
+      // so a slot shifting cannot corrupt them.
       const values = info?.widgets_values;
       if (!Array.isArray(values)) return;
-      const rows = values.filter(
-        (v) => v && typeof v === "object" && !Array.isArray(v) && "lora" in v
-      );
+      // Format 1 kept a trailing slot per button, and any workflow saved after
+      // one of those buttons had absorbed a row carries that row twice.  The
+      // button slots are always the last three, so a format-1 array is trimmed
+      // back to the rows; format 2 no longer writes them at all.
+      const format = info?.properties?.[ROW_FORMAT_KEY] ?? 1;
+      const slots =
+        format >= ROW_FORMAT
+          ? values
+          : values.slice(0, Math.max(0, values.length - LEGACY_BUTTON_SLOTS));
+      const rows = slots.filter(isRowValue);
+      this.properties = this.properties || {};
+      this.properties[ROW_FORMAT_KEY] = ROW_FORMAT;   // re-save in the new shape
       for (const w of loraWidgets(this)) removeLoraWidget(this, w);
       for (const row of rows) addLoraWidget(this, row);
       updateBalanceLabel(this);   // rows carry the balance state, so recover it
