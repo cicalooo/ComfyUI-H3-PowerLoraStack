@@ -64,9 +64,9 @@ applies as a `("diff",)` patch on the sibling `.bias`; without it the port is
 nearly worthless. Measured end to end, the ported adapter reproduces the dense
 contribution at **cos 0.999998**.
 
-The fit uses the *target checkpoint's own* table, because bakes differ — locally,
-`PinkCherry` ships an uncentered basis (column norms 22.98, 2.67, 1.66, …) while
-`10Eros_Max` ships comfy's mean-centered one (7.08, 2.09, 0.75, …).
+The fit uses the *target checkpoint's own* table, because bakes differ — of two
+local bakes, one ships an uncentered basis (column norms 22.98, 2.67, 1.66, …)
+while the other ships comfy's mean-centered one (7.08, 2.09, 0.75, …).
 
 **This also catches a silent failure the stock loader cannot see.** Two curve
 bakes have the same adaLN width, so a LoRA trained against one loads without
@@ -243,9 +243,9 @@ base: ConvRotW4A4 x300, INT8 x50
 adaLN: curve (input dim 8)
 turbo dense-adaLN @ 1: 26 merged, 275 branched, adaLN ported x51 (basis fit 1.7e-03)
   rel dW 0.047%
-GalaxyAce curve-adaLN @ 0.8: 0 merged, 258 branched, adaLN modality video/text/audio = 1/1/0.25 x50
+style_lora curve-adaLN @ 0.8: 0 merged, 258 branched, adaLN modality video/text/audio = 1/1/0.25 x50
   rel dW 0.054%
-footjob @ 1: 0 merged, 104 branched, adaLN modality 1/1/0.25 INACTIVE (LoRA has no adaLN pairs)
+motion_lora @ 1: 0 merged, 104 branched, adaLN modality 1/1/0.25 INACTIVE (LoRA has no adaLN pairs)
   rel dW 0.316%
 branch bank: 300 layers, 412 MB
 ```

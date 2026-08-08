@@ -50,8 +50,8 @@ Checks performed:
   with zero unmatched keys.
 - Synthetic dense→curve conversion had maximum absolute error around `1.5e-5`.
 - Synthetic two-LoRA fusion had maximum absolute error around `2.0e-6`.
-- The discovered silu grid is `[1025, 2688]`; 10Eros and PinkCherry curve tables
-  both fitted at approximately `1.68e-3` relative residual.
+- The discovered silu grid is `[1025, 2688]`; the two local curve tables both
+  fitted at approximately `1.68e-3` relative residual.
 - A CUDA table-to-table fit reproduced the device mismatch described in finding
   H5 below.
 

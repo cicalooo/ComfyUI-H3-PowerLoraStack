@@ -46,7 +46,7 @@ from . import keymap
 LOG = logging.getLogger("h3.powerlorastack")
 
 # Median RMS of the base weights per module group, i.e. ||W||_F / sqrt(out*in).
-# Measured over all 260 2-D layers of 10Eros_Max_h3_fl2va_pruned_int8_convrot.
+# Measured over all 260 2-D layers of a local h3 fl2va pruned int8 convrot bake.
 _BASE_RMS = {
     "qkv": 0.1336,
     "out": 0.1395,
