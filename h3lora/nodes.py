@@ -124,6 +124,10 @@ class H3PowerLoraStack:
                     "tooltip": "Rebase adaLN LoRA pairs between dense (2688) and curve (8) "
                                "checkpoints. Needs h3_silu_temb_grid.safetensors.",
                 }),
+                "adaln_modality": ("H3_MODALITY", {
+                    "tooltip": "Optional. Wire a MiniMax H3 adaLN Modality node here to "
+                               "scale every stacked LoRA's adaLN modulation per modality.",
+                }),
             }),
             "hidden": {},
         }
@@ -135,7 +139,8 @@ class H3PowerLoraStack:
     CATEGORY = CATEGORY
     DESCRIPTION = __doc__
 
-    def apply(self, model=None, quantized_layers="auto", adaln_port="auto", **kwargs):
+    def apply(self, model=None, quantized_layers="auto", adaln_port="auto",
+              adaln_modality=None, **kwargs):
         if model is None:
             raise ValueError("H3 Power LoRA Stack: no model connected")
 
@@ -145,10 +150,54 @@ class H3PowerLoraStack:
 
         patcher, report = apply_mod.apply_stack(
             model, entries, mode=quantized_layers, adaln_mode=adaln_port,
+            modality=adaln_modality,
         )
         text = report.text()
         LOG.info("H3 Power LoRA Stack:\n%s", text)
         return (patcher, text)
+
+
+class H3AdalnModality:
+    """Scale a stacked LoRA's adaLN modulation per modality.
+
+    H3 runs audio and video through the same 50 blocks, so there are no audio
+    layers to target the way LTX 2.3 allows. The one pathway that does separate
+    cleanly is adaLN: its projection emits three contiguous row blocks, one per
+    modality, so scaling a slice steers that modality's modulation exactly.
+
+    Wire the output into the stack's ``adaln_modality`` input. Leaving all three
+    at 1.0 is a no-op; 0.0 removes that modality's share of the adapter.
+
+    Only affects LoRAs that carry adaLN pairs -- the stack's report says, per
+    LoRA, whether the control was actually live. It does not isolate a modality:
+    attention is joint over the packed sequence, so this changes where a LoRA is
+    applied, not everything it eventually reaches.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        slider = {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}
+        return {"required": {
+            "video": ("FLOAT", dict(slider, tooltip="Scale for the video modality (tag 0).")),
+            "text": ("FLOAT", dict(slider, tooltip="Scale for the text/conditioning modality (tag 1).")),
+            "audio": ("FLOAT", dict(slider, tooltip="Scale for the audio modality (tag 2).")),
+        }}
+
+    RETURN_TYPES = ("H3_MODALITY", "STRING")
+    RETURN_NAMES = ("adaln_modality", "info")
+    OUTPUT_TOOLTIPS = ("Wire into the stack's adaln_modality input",
+                       "What this setting will do")
+    FUNCTION = "build"
+    CATEGORY = CATEGORY
+    DESCRIPTION = __doc__
+
+    def build(self, video=1.0, text=1.0, audio=1.0):
+        values = {"video": float(video), "text": float(text), "audio": float(audio)}
+        if all(v == 1.0 for v in values.values()):
+            info = "no-op (all modalities at 1.0)"
+        else:
+            info = "adaLN " + ", ".join(f"{k} x{v:g}" for k, v in values.items())
+        return (values, info)
 
 
 class H3LoraInspector:
@@ -193,10 +242,12 @@ class H3LoraInspector:
 
 NODE_CLASS_MAPPINGS = {
     "H3PowerLoraStack": H3PowerLoraStack,
+    "H3AdalnModality": H3AdalnModality,
     "H3LoraInspector": H3LoraInspector,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3PowerLoraStack": "MiniMax H3 Power LoRA Stack",
+    "H3AdalnModality": "MiniMax H3 adaLN Modality",
     "H3LoraInspector": "MiniMax H3 LoRA Inspector",
 }

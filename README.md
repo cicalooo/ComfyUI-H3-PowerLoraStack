@@ -7,7 +7,8 @@ Lora Loader but built around the three things that actually break H3 LoRAs.
 
 | Node | Purpose |
 |---|---|
-| **MiniMax H3 Power LoRA Stack** | Any number of LoRAs on one node, each with a toggle and strength |
+| **MiniMax H3 Power LoRA Stack** | Any number of LoRAs on one node, each with a toggle and strength, plus one-click strength calibration |
+| **MiniMax H3 adaLN Modality** | Scales stacked LoRAs' adaLN modulation per modality (video / text / audio) |
 | **MiniMax H3 LoRA Inspector** | Reports a LoRA's format, rank and adaLN basis without loading it |
 
 ## Why not just use a normal LoRA loader
@@ -114,6 +115,123 @@ so a ten-LoRA stack costs one extra matmul pair per layer, not ten. The factors
 live in a `_LoraBank` registered via `set_additional_models`, so its VRAM is
 accounted for and comfy's weakref bookkeeping stays quiet.
 
+## Auto-balance
+
+**Strength 1.0 is not a unit.** Measured across the 27 non-distillation H3 LoRAs
+in `models/loras/h3`, the perturbation produced at strength 1.0 spans **65×** —
+0.054% of the base weights at one end, 5.24% at the other. Neither rank nor file
+size predicts it: a rank-128 adapter sits at 0.088% while a rank-16 one sits at
+0.40%. So a strength that worked on one LoRA carries no information about the
+next, and the sweet spot has to be rediscovered per file.
+
+`⚖ Auto-balance strengths` measures what each active LoRA actually does and puts
+them all on one scale:
+
+```
+rel = sqrt( sum_l ||dW_l||_F^2 / sum_l ||W_l||_F^2 )
+```
+
+The factor multiplies the strength you already chose, so your relative intent
+between rows survives — what changes is that a LoRA perturbing the model 18×
+harder than usual stops arriving at full force. `↺ Restore manual strengths`
+puts every row back exactly as it was; the pre-balance value is stashed on the
+row, so it survives saving and reloading the workflow. Editing a strength by
+hand overrides that row and is not clobbered by a later recompute.
+
+**The factor only ever trims** (clamped to ≤ 1). A LoRA measuring *below* the
+reference may be quiet deliberately — distillation adapters sit an order of
+magnitude down and are correct at 1.0 — whereas one measuring far above it
+essentially never is. That asymmetry means no classifier is needed: every turbo
+LoRA in the collection lands on ×1.00 by itself.
+
+Computing this is only affordable because `dW` is never formed. It is up to
+28672 × 5376 and there are ~260 per file, but
+
+```
+||B A||_F^2 = tr((B^T B)(A A^T))
+```
+
+needs only r×r matrices, so a 2.4 GB rank-128 adapter measures in a few seconds,
+almost all of it disk. Results cache on (path, mtime, size). LoKr is handled too
+— `||W1 ⊗ W2||_F = ||W1||_F · ||W2||_F`.
+
+The reference is the *median* of the collection rather than a hand-picked
+target, so the calibration agrees with trainer defaults on ordinary files and
+only moves outliers. Base norms come from a per-group constant (measured base
+weight RMS is uniform to ~2× within a group and the four linear groups agree to
+20%), which avoids reading the 20 GB checkpoint.
+
+adaLN is excluded from the measurement: its basis is checkpoint-dependent — the
+same adapter shipped dense and curve8 differs 5.7× there — and it is where a
+distillation LoRA keeps the schedule change that must not be normalised away.
+
+Two honest limits: Frobenius energy is not perceptual strength, and it says
+nothing about *contention*. Distinct LoRAs are near-orthogonal in weight space
+(measured |cos| ≤ 0.03) yet overlap 3–15× above chance in the feature subspaces
+they read and write, so two adapters can still fight over the same features at
+perfectly balanced magnitudes.
+
+Because the deltas really are near-orthogonal, stack energy adds in quadrature:
+holding a stack at the "one LoRA at 1.0" budget wants `1/√N`, not the `1/N` that
+gets recommended. Auto-balance does **not** apply that — it calibrates each LoRA
+and leaves the total to you, so adding a row never silently weakens the others.
+
+## adaLN modality control
+
+**MiniMax H3 is not built like LTX 2.3.** LTX duplicates the tower per modality
+(`audio_attn`, `audio_ff`, `audio_patchify_proj`, `audio_to_video_attn`), so a
+LoRA can be steered by picking layers. H3 packs audio and video into one token
+sequence and pushes both through the same 50 blocks. The only modality-specific
+weights in the entire checkpoint are four tensors — `video_patch_proj`,
+`audio_patch_proj`, `final_layer.video_out`, `final_layer.audio_out` — and none
+of the 46 H3 LoRAs checked touches any of them. There is no layer-name axis.
+
+One pathway does separate cleanly: **adaLN**. `AdalnProj.forward` computes
+`linear(t) -> [M, expand*hidden*modalities]` then `view(M*modalities,
+expand*hidden)`, so output feature `j` belongs to modality `j //
+(expand*hidden)`. The 96768 rows are three contiguous blocks of 32256, and
+`comfy/ldm/minimax/model.py` tags segments `{video: 0, text: 1, audio: 2}`.
+Scaling a slice of `lora_B`'s rows scales that modality's modulation exactly,
+with no runtime hook.
+
+Wire **MiniMax H3 adaLN Modality** into the stack's `adaln_modality` input. All
+three at 1.0 is a no-op; 0.0 removes that modality's share of every stacked
+adapter.
+
+This holds for future LoRAs *by construction*: the row order is a property of the
+trained weights, not of ComfyUI. Any adapter that loads onto `adaln_proj.linear`
+at all must match it, whatever its rank, alpha, trainer convention, or adaLN
+basis (dense/curve affects only the `A` side). All seven local H3 bakes — fl2va,
+ref2va, int8-convrot, w4a8-mixed, int4-BQ — carry identical geometry.
+
+The geometry is read off the model's own `AdalnProj` rather than hardcoded, and
+every layer is shape-checked before it is touched, so a future H3 variant either
+adapts or keeps today's behaviour — it cannot slice at the wrong offsets.
+`final_layer.adaln_proj` is `AdalnProj(t_dim, hidden, 2, 1)` — one modality,
+differentiated only by timestep — so it fails that check and is left alone.
+
+Ordering matters and is handled: the scaling runs *before* adaLN porting, which
+derives its bias delta as `B @ const`, so the emitted `.diff_b` inherits it.
+
+### What it does not do
+
+- **Half your library is unaffected.** Only 22 of 46 LoRAs carry adaLN pairs at
+  all; for the rest this is inert. The report says so per LoRA rather than
+  silently doing nothing.
+- **It does not isolate a modality.** Attention is joint over the packed
+  sequence, so damping video changes where a LoRA is applied, not everything it
+  eventually reaches.
+- The four big linears (`qkv`/`out`/`fc1`/`fc2`) are shared and cannot be split
+  this way at all.
+
+Where adaLN *is* present it is not a marginal knob. Measured on the 14 LoRAs
+whose adaLN basis matches the checkpoint, it carries 89–99.7% of the
+weight-space perturbation for content LoRAs (median ~96%) and 16–23% for the
+curve8 turbo adapters. Caveat: relative Frobenius across differently-shaped
+matrices is an imperfect proxy for perceptual impact, and adaLN's input is only
+8-dimensional, so read that as "where most of the weight change lives", not "96%
+of what you see".
+
 ## Output
 
 The `report` string output accounts for every LoRA (wire it to a preview/show-text
@@ -123,9 +241,18 @@ node to read it; it is also written to the console log):
 base: ConvRotW4A4 x300, INT8 x50
 adaLN: curve (input dim 8)
 turbo dense-adaLN @ 1: 26 merged, 275 branched, adaLN ported x51 (basis fit 1.7e-03)
-GalaxyAce curve-adaLN @ 0.8: 0 merged, 258 branched
+  rel dW 0.047%
+GalaxyAce curve-adaLN @ 0.8: 0 merged, 258 branched, adaLN modality video/text/audio = 1/1/0.25 x50
+  rel dW 0.054%
+footjob @ 1: 0 merged, 104 branched, adaLN modality 1/1/0.25 INACTIVE (LoRA has no adaLN pairs)
+  rel dW 0.316%
 branch bank: 300 layers, 412 MB
 ```
+
+`rel dW` is the measurement above, reported for every LoRA whether or not
+auto-balance was used, so an out-of-scale strength is visible from the API too.
+When the applied strength is far from the calibrated one the line says what
+auto-balance would have used.
 
 ## Limitations
 

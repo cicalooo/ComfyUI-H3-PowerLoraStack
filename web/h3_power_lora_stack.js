@@ -5,6 +5,10 @@ const NODE_TYPE = "H3PowerLoraStack";
 const ROW_HEIGHT = 22;
 const MARGIN = 12;
 
+const BALANCE_ROUTE = "/h3_power_lora_stack/balance";
+const BALANCE_LABEL = "⚖ Auto-balance strengths";
+const RESTORE_LABEL = "↺ Restore manual strengths";
+
 // Session cache for the loras folder listing.  Deliberately a module global
 // rather than graph.extra: anything hung off the graph is serialized into the
 // saved workflow, which would bake a stale copy of the whole folder into every
@@ -31,6 +35,25 @@ function fetchLoraList() {
       });
   }
   return loraListPromise;
+}
+
+/**
+ * Ask the server what each LoRA actually does to the weights.
+ *
+ * "Strength 1.0" is not a unit -- across the local H3 collection the
+ * perturbation it produces spans 65x -- so the server measures each file and
+ * returns the multiplier that puts it on the same scale as the rest.  Results
+ * are cached server-side on (path, mtime, size), so pressing the button again
+ * costs one round trip and no disk.
+ */
+async function fetchBalance(names) {
+  const res = await api.fetchApi(BALANCE_ROUTE, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ loras: names }),
+  });
+  if (!res.ok) throw new Error(`balance request failed (${res.status})`);
+  return res.json();
 }
 
 function drawToggle(ctx, x, y, size, on) {
@@ -117,8 +140,24 @@ function makeLoraWidget(node, name, value) {
       this.hitAreas.strengthUp = [strengthRight - 18, strengthRight];
       this.hitAreas.strengthValue = [strengthLeft + 18, strengthRight - 18];
 
+      // auto-balance badge: what the measurement did to this row.  Amber flags
+      // a note from the server (a duplicate adapter, or an unreadable file).
+      let badgeLeft = strengthLeft - 10;
+      if (this.value.autoApplied && this.value.factor !== undefined) {
+        const badge = `⚖×${Number(this.value.factor).toFixed(2)}`;
+        ctx.font = "10px sans-serif";
+        ctx.textAlign = "right";
+        ctx.fillStyle = this.value.note
+          ? "#d99a4e"
+          : this.value.factor < 0.995
+            ? "#7fd6a0"
+            : "#6a6a6a";
+        ctx.fillText(badge, strengthLeft - 8, midY);
+        badgeLeft = strengthLeft - 14 - ctx.measureText(badge).width;
+      }
+
       const nameLeft = cursor;
-      const nameRight = strengthLeft - 10;
+      const nameRight = badgeLeft;
       ctx.textAlign = "left";
       ctx.fillStyle = this.value.on ? "#e8e8e8" : "#777";
       ctx.font = "12px sans-serif";
@@ -145,6 +184,8 @@ function makeLoraWidget(node, name, value) {
       if (hit(this.hitAreas.toggle)) {
         this.value = { ...this.value, on: !this.value.on };
         node_.setDirtyCanvas(true, true);
+        // a row switched on inside a balanced stack has not been measured yet
+        if (this.value.on && isBalanced(node_)) applyBalance(node_);
         return true;
       }
       if (hit(this.hitAreas.remove)) {
@@ -152,13 +193,11 @@ function makeLoraWidget(node, name, value) {
         return true;
       }
       if (hit(this.hitAreas.strengthDown)) {
-        this.value = { ...this.value, strength: round2(this.value.strength - 0.05) };
-        node_.setDirtyCanvas(true, true);
+        this.setStrength(node_, round2(this.value.strength - 0.05));
         return true;
       }
       if (hit(this.hitAreas.strengthUp)) {
-        this.value = { ...this.value, strength: round2(this.value.strength + 0.05) };
-        node_.setDirtyCanvas(true, true);
+        this.setStrength(node_, round2(this.value.strength + 0.05));
         return true;
       }
       if (hit(this.hitAreas.strengthValue)) {
@@ -167,10 +206,7 @@ function makeLoraWidget(node, name, value) {
           this.value.strength,
           (v) => {
             const parsed = parseFloat(v);
-            if (!Number.isNaN(parsed)) {
-              this.value = { ...this.value, strength: parsed };
-              node_.setDirtyCanvas(true, true);
-            }
+            if (!Number.isNaN(parsed)) this.setStrength(node_, parsed);
           },
           event
         );
@@ -181,6 +217,16 @@ function makeLoraWidget(node, name, value) {
         return true;
       }
       return false;
+    },
+
+    /**
+     * Editing a strength by hand overrides the balance for this row: the badge
+     * clears and a later recompute leaves it alone, but the stashed manual
+     * value stays put so Restore still returns to what was there before.
+     */
+    setStrength(node_, value) {
+      this.value = { ...this.value, strength: value, autoApplied: false };
+      node_.setDirtyCanvas(true, true);
     },
 
     serializeValue() {
@@ -324,9 +370,22 @@ async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}
   };
   const commit = (value) => {
     committed = true;
-    widget.value = { ...widget.value, lora: value };
+    const next = { ...widget.value, lora: value };
+    // the balance factor belonged to the file that was here before, so drop the
+    // whole measurement and hand the row back its manual strength; clearing the
+    // stash too is what marks it for re-measuring
+    if (next.manual !== undefined || next.autoApplied) {
+      next.strength = next.manual !== undefined ? next.manual : next.strength;
+      delete next.manual;
+      delete next.factor;
+      delete next.rel;
+      delete next.note;
+      delete next.autoApplied;
+    }
+    widget.value = next;
     node.setDirtyCanvas(true, true);
     close();
+    if (isBalanced(node)) applyBalance(node);
   };
   const onOutside = (e) => {
     if (!root.contains(e.target)) close();
@@ -424,6 +483,109 @@ function loraWidgets(node) {
   return (node.widgets || []).filter((w) => w.type === "H3_LORA");
 }
 
+/* --------------------------------------------------------------- balance -- */
+
+function activeRows(node) {
+  return loraWidgets(node).filter(
+    (w) => w.value.on && w.value.lora && w.value.lora !== "None"
+  );
+}
+
+/**
+ * Whether the stack is in auto-balance mode.  Derived from the rows rather than
+ * held as node state: ``manual`` is stashed on every balanced row and rows are
+ * already serialized, so the mode survives a save/reload for free.
+ */
+function isBalanced(node) {
+  return loraWidgets(node).some((w) => w.value.manual !== undefined);
+}
+
+function updateBalanceLabel(node) {
+  const button = (node.widgets || []).find((w) => w.h3Role === "balance");
+  if (!button) return;
+  if (!isBalanced(node)) {
+    button.name = BALANCE_LABEL;
+  } else {
+    const applied = loraWidgets(node).filter((w) => w.value.autoApplied);
+    const trimmed = applied.filter((w) => (w.value.factor ?? 1) < 0.995).length;
+    button.name = `⚖ Balanced — ${trimmed}/${applied.length} trimmed`;
+  }
+  node.setDirtyCanvas(true, true);
+}
+
+/**
+ * Put every active row onto one strength unit.
+ *
+ * The measured factor multiplies the strength the user already chose, so their
+ * relative intent between rows survives; what changes is that a LoRA which
+ * perturbs the model 18x harder than usual stops arriving at full force.  The
+ * factor only ever trims (server-side it is clamped to <= 1): a LoRA measuring
+ * below the reference may be quiet deliberately -- distillation adapters sit an
+ * order of magnitude down and are correct at 1.0 -- so boosting is not safe,
+ * while a LoRA measuring far above it essentially never is.
+ *
+ * ``force`` re-measures every active row, which is what the button does.  The
+ * implicit calls -- made when a row is switched on or repointed inside an
+ * already-balanced stack -- only touch rows that carry no stash yet, so a row
+ * the user has since edited by hand is not quietly pulled back to its
+ * calibrated value.
+ */
+async function applyBalance(node, { force = false } = {}) {
+  const rows = activeRows(node).filter((w) => force || w.value.manual === undefined);
+  if (!rows.length) {
+    updateBalanceLabel(node);
+    return;
+  }
+  let data;
+  try {
+    data = await fetchBalance([...new Set(rows.map((w) => w.value.lora))]);
+  } catch (err) {
+    console.error("[H3PowerLoraStack] auto-balance failed", err);
+    return;
+  }
+  const results = data?.results ?? {};
+  for (const widget of rows) {
+    const result = results[widget.value.lora];
+    if (!result) continue;
+    const manual =
+      widget.value.manual !== undefined ? widget.value.manual : widget.value.strength;
+    const factor = result.factor ?? 1;
+    widget.value = {
+      ...widget.value,
+      manual,
+      strength: round2(manual * factor),
+      factor,
+      rel: result.rel ?? null,
+      note: result.note ?? "",
+      autoApplied: true,
+    };
+    if (result.note) {
+      console.warn(`[H3PowerLoraStack] ${widget.value.lora}: ${result.note}`);
+    }
+  }
+  updateBalanceLabel(node);
+  node.setDirtyCanvas(true, true);
+}
+
+/** Hand every row back the strength it had before auto-balance touched it. */
+function restoreManual(node) {
+  let restored = 0;
+  for (const widget of loraWidgets(node)) {
+    if (widget.value.manual === undefined) continue;
+    const next = { ...widget.value, strength: widget.value.manual };
+    delete next.manual;
+    delete next.factor;
+    delete next.rel;
+    delete next.note;
+    delete next.autoApplied;
+    widget.value = next;
+    restored += 1;
+  }
+  updateBalanceLabel(node);
+  node.setDirtyCanvas(true, true);
+  return restored;
+}
+
 function renumber(node) {
   loraWidgets(node).forEach((w, i) => {
     w.name = `lora_${i + 1}`;
@@ -478,6 +640,18 @@ app.registerExtension({
         showLoraMenu(this, widget, event, { removeOnCancel: true });
       });
 
+      const balance = this.addWidget("button", BALANCE_LABEL, null, () => {
+        applyBalance(this, { force: true });
+      });
+      balance.h3Role = "balance";
+
+      const restore = this.addWidget("button", RESTORE_LABEL, null, () => {
+        if (!restoreManual(this)) {
+          console.info("[H3PowerLoraStack] nothing to restore, no balance applied");
+        }
+      });
+      restore.h3Role = "restore";
+
       fetchLoraList();   // warm the cache so the first picker opens instantly
       resize(this);
     };
@@ -496,6 +670,7 @@ app.registerExtension({
       );
       for (const w of loraWidgets(this)) removeLoraWidget(this, w);
       for (const row of rows) addLoraWidget(this, row);
+      updateBalanceLabel(this);   // rows carry the balance state, so recover it
       resize(this);
     };
   },

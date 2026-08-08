@@ -12,7 +12,9 @@ from comfy.weight_adapter import LoRAAdapter
 
 from . import adaln as adaln_mod
 from . import branch as branch_mod
+from . import gain
 from . import keymap
+from . import modality as modality_mod
 
 LOG = logging.getLogger("h3.powerlorastack")
 
@@ -96,11 +98,14 @@ def detect_quantization(model_patcher) -> str:
 
 
 def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
-                report: StackReport | None = None):
+                report: StackReport | None = None, modality=None):
     """Apply a list of ``{'path', 'name', 'strength'}`` LoRAs to an H3 model.
 
     ``mode`` is ``auto`` (branch quantized layers, merge the rest), ``merge``
     (stock behaviour) or ``branch`` (never touch a weight).
+
+    ``modality`` optionally scales each LoRA's adaLN modulation per modality;
+    see :mod:`h3lora.modality`.
     """
     report = report or StackReport()
     patcher = model.clone()
@@ -122,8 +127,17 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
             grid_path = adaln_mod.find_silu_grid()
         adaln_ctx = adaln_mod.AdalnContext(target_dim, table, grid_path)
 
+    mod_values = modality_mod.normalize_scales(modality)
+    mod_geom = None if modality_mod.is_identity(mod_values) else modality_mod.geometry(diffusion_model)
+
     report.add(f"base: {detect_quantization(patcher)}")
     report.add(f"adaLN: {'curve' if table is not None else 'dense'} (input dim {target_dim})")
+    if not modality_mod.is_identity(mod_values) and mod_geom is None:
+        report.add("  ! adaLN modality control requested but this model's adaLN "
+                   "does not split into the expected modalities - ignored")
+        # the header carries the reason; keep the per-LoRA notes from blaming it
+        # on the LoRAs, which are not at fault here
+        mod_values = None
 
     per_module: "OrderedDict[str, list]" = OrderedDict()
     compute_dtype = model.model_dtype()
@@ -134,6 +148,13 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
         lora_sd = comfy.utils.load_torch_file(entry["path"], safe_load=True)
 
         normalized, unmatched = keymap.normalize(lora_sd, index)
+        measured = gain.measure_state_dict(normalized, name)
+
+        # before porting: the port derives its bias delta as ``B @ const``, so
+        # scaling B's rows here carries through to the emitted .diff_b
+        normalized, mod_stats = modality_mod.apply_to_state_dict(
+            normalized, mod_values, mod_geom)
+        mod_note = modality_mod.describe(mod_values, mod_stats)
         adaln_note = ""
         if adaln_ctx is not None and target_dim:
             source_table = normalized.pop("adaln_t_table", None)
@@ -179,7 +200,15 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
         detail = f"{len(merge)} merged, {branched_here} branched"
         if unmatched:
             detail += f", {len(unmatched)} unmatched"
-        report.add(f"{name} @ {strength:g}: {detail}{adaln_note}")
+        report.add(f"{name} @ {strength:g}: {detail}{adaln_note}{mod_note}")
+        if measured.get("rel"):
+            # what this LoRA actually does to the weights, so a strength that is
+            # far off the calibrated unit is visible without the UI button
+            note = f"  rel dW {measured['rel'] * 100:.3f}%"
+            suggested = measured["factor"]
+            if abs(strength - suggested) > 0.1 * max(suggested, 1e-6):
+                note += f" (auto-balance would use {suggested:.2f})"
+            report.add(note)
         if not merge and not branched_here:
             report.add(f"  ! {name} matched no layers on this model")
 
