@@ -6,11 +6,13 @@ Lora Loader but built around the three things that actually break H3 LoRAs.
 <img width="1533" height="487" alt="Screenshot 2026-08-08 211513" src="https://github.com/user-attachments/assets/cf7ba1dc-96d9-42ae-8c77-89905319b816" />
 
 ## Nodes
-| Node | Purpose |
-|---|---|
+
+| Node                            | Purpose                                                                                               |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | **MiniMax H3 Power LoRA Stack** | Any number of LoRAs on one node, each with a toggle and strength, plus one-click strength calibration |
-| **MiniMax H3 adaLN Modality** | Scales stacked LoRAs' adaLN modulation per modality (video / text / audio) |
-| **MiniMax H3 LoRA Inspector** | Reports a LoRA's format, rank and adaLN basis without loading it |
+| **MiniMax H3 adaLN Modality**   | Scales stacked LoRAs' adaLN modulation per modality (video / text / audio)                            |
+| **MiniMax H3 LoRA Schedule**    | Varies selected stack rows' strength over denoising steps or normalized sigma                         |
+| **MiniMax H3 LoRA Inspector**   | Reports a LoRA's format, rank and adaLN basis without loading it                                      |
 
 ## Why not just use a normal LoRA loader
 
@@ -93,13 +95,13 @@ Every H3 LoRA naming convention resolves against the model's own key set rather
 than by guessing where underscores split, so `qkv_proj` is never mistaken for
 two tokens:
 
-| Convention | Example |
-|---|---|
-| ai-toolkit / diffusers | `diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight` |
-| bare (no prefix) | `blocks.0.attn.qkv_proj.lora_A.weight` |
-| kohya / musubi | `lora_unet_blocks_0_attn_qkv_proj.lora_down.weight` + `.alpha` |
-| lycoris | `lycoris_blocks_0_...` |
-| peft / diffusers trainer | `base_model.model.blocks.0...`, `transformer.blocks.0...` |
+| Convention               | Example                                                        |
+| ------------------------ | -------------------------------------------------------------- |
+| ai-toolkit / diffusers   | `diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight`         |
+| bare (no prefix)         | `blocks.0.attn.qkv_proj.lora_A.weight`                         |
+| kohya / musubi           | `lora_unet_blocks_0_attn_qkv_proj.lora_down.weight` + `.alpha` |
+| lycoris                  | `lycoris_blocks_0_...`                                         |
+| peft / diffusers trainer | `base_model.model.blocks.0...`, `transformer.blocks.0...`      |
 
 Verified against all 37 H3 LoRAs in `models/loras/h3`: **zero unmatched keys.**
 
@@ -115,6 +117,25 @@ sum_i s_i * B_i @ A_i @ x  ==  [s_1 B_1 | ... | s_N B_N] @ [A_1; ...; A_N] @ x
 so a ten-LoRA stack costs one extra matmul pair per layer, not ten. The factors
 live in a `_LoraBank` registered via `set_additional_models`, so its VRAM is
 accounted for and comfy's weakref bookkeeping stays quiet.
+
+## Denoising schedules
+
+**MiniMax H3 LoRA Schedule** changes selected stack rows' strength during
+sampling. Wire its `schedule` output into the stack, select rows with `all`,
+`1,3`, or `2-4`, then choose a linear, cosine, smoothstep, power, step, or
+explicit curve. `start_percent` and `end_percent` limit the transition to part
+of the trajectory. Chain schedule nodes for different row groups; the later
+node wins where selectors overlap.
+
+The `steps` domain follows model-call indices. The `sigma` domain follows the
+scheduler's actual normalized noise values, which can produce a different
+shape with non-linear schedulers. The stack reads `sample_sigmas` supplied by
+ComfyUI automatically, so plain KSampler works and **no SIGMAS wire is needed**.
+
+Scheduled rows always use the live branch path, including on unquantized bases.
+Any adapter feature or fused layer that cannot run as a branch is merged at the
+row's ordinary static strength and called out in the report. Ported adaLN bias
+deltas are scheduled with their LoRA rather than being left at a fixed value.
 
 ## Auto-balance
 
@@ -214,16 +235,7 @@ differentiated only by timestep — so it fails that check and is left alone.
 Ordering matters and is handled: the scaling runs *before* adaLN porting, which
 derives its bias delta as `B @ const`, so the emitted `.diff_b` inherits it.
 
-### What it does not do
 
-- **Half your library is unaffected.** Only 22 of 46 LoRAs carry adaLN pairs at
-  all; for the rest this is inert. The report says so per LoRA rather than
-  silently doing nothing.
-- **It does not isolate a modality.** Attention is joint over the packed
-  sequence, so damping video changes where a LoRA is applied, not everything it
-  eventually reaches.
-- The four big linears (`qkv`/`out`/`fc1`/`fc2`) are shared and cannot be split
-  this way at all.
 
 Where adaLN *is* present it is not a marginal knob. Measured on the 14 LoRAs
 whose adaLN basis matches the checkpoint, it carries 89–99.7% of the

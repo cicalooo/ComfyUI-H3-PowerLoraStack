@@ -8,6 +8,7 @@ import folder_paths
 
 from . import apply as apply_mod
 from . import detect
+from .schedule import Schedule
 
 LOG = logging.getLogger("h3.powerlorastack")
 CATEGORY = "MiniMax-H3/lora"
@@ -76,7 +77,7 @@ def _collect(kwargs):
     rows.sort(key=lambda item: item[0])
 
     entries = []
-    for _, value in rows:
+    for order, value in rows:
         if not value.get("on", True):
             continue
         strength = float(value.get("strength", 1.0))
@@ -89,7 +90,7 @@ def _collect(kwargs):
         if path is None:
             LOG.warning("H3 Power LoRA Stack: could not find lora %r, skipping", name)
             continue
-        entries.append({"name": name, "path": path, "strength": strength})
+        entries.append({"name": name, "path": path, "strength": strength, "row": order})
     return entries
 
 
@@ -128,6 +129,10 @@ class H3PowerLoraStack:
                     "tooltip": "Optional. Wire a MiniMax H3 adaLN Modality node here to "
                                "scale every stacked LoRA's adaLN modulation per modality.",
                 }),
+                "schedule": ("H3_SCHEDULE", {
+                    "tooltip": "Optional. Wire an H3 LoRA Schedule chain here to vary selected "
+                               "row strengths over the denoising trajectory.",
+                }),
             }),
             "hidden": {},
         }
@@ -140,7 +145,7 @@ class H3PowerLoraStack:
     DESCRIPTION = __doc__
 
     def apply(self, model=None, quantized_layers="auto", adaln_port="auto",
-              adaln_modality=None, **kwargs):
+              adaln_modality=None, schedule=None, **kwargs):
         if model is None:
             raise ValueError("H3 Power LoRA Stack: no model connected")
 
@@ -150,7 +155,7 @@ class H3PowerLoraStack:
 
         patcher, report = apply_mod.apply_stack(
             model, entries, mode=quantized_layers, adaln_mode=adaln_port,
-            modality=adaln_modality,
+            modality=adaln_modality, schedule=schedule,
         )
         text = report.text()
         LOG.info("H3 Power LoRA Stack:\n%s", text)
@@ -200,6 +205,68 @@ class H3AdalnModality:
         return (values, info)
 
 
+class H3LoraSchedule:
+    """Schedule selected Power LoRA Stack rows over sampler steps or sigma.
+
+    Chain multiple nodes when different rows need different schedules; the
+    later node wins where row selectors overlap. The stack reads ComfyUI's
+    sampler timeline automatically, so no SIGMAS connection is required.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        strength = {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}
+        percent = {"min": 0.0, "max": 100.0, "step": 1.0}
+        return {
+            "required": {
+                "rows": ("STRING", {"default": "all", "tooltip": "all, 1,3, or 2-4"}),
+                "start_strength": ("FLOAT", dict(strength, default=1.0)),
+                "end_strength": ("FLOAT", dict(strength, default=0.1)),
+                "curve": (["linear", "cosine", "smoothstep", "power", "step", "explicit"],),
+                "curve_power": ("FLOAT", {"default": 2.0, "min": 0.01, "max": 20.0, "step": 0.05}),
+                "explicit_strengths": ("STRING", {
+                    "default": "", "multiline": True,
+                    "tooltip": "Comma- or space-separated strengths, one per intended step.",
+                }),
+                "start_percent": ("FLOAT", dict(percent, default=0.0)),
+                "end_percent": ("FLOAT", dict(percent, default=100.0)),
+                "domain": (["steps", "sigma"], {
+                    "tooltip": "steps follows model-call indices; sigma follows the scheduler's "
+                               "actual normalized noise values.",
+                }),
+            },
+            "optional": {
+                "schedule": ("H3_SCHEDULE", {
+                    "tooltip": "Optional earlier schedule link. This node wins on overlaps.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("H3_SCHEDULE", "STRING")
+    RETURN_NAMES = ("schedule", "info")
+    OUTPUT_TOOLTIPS = ("Wire into the Power LoRA Stack's schedule input", "Schedule summary")
+    FUNCTION = "build"
+    CATEGORY = CATEGORY
+    DESCRIPTION = __doc__
+
+    def build(self, rows="all", start_strength=1.0, end_strength=0.1,
+              curve="linear", curve_power=2.0, explicit_strengths="",
+              start_percent=0.0, end_percent=100.0, domain="steps", schedule=None):
+        item = Schedule(
+            rows=str(rows), start_strength=float(start_strength),
+            end_strength=float(end_strength), curve=curve,
+            curve_power=float(curve_power), explicit_strengths=str(explicit_strengths),
+            start_percent=float(start_percent), end_percent=float(end_percent), domain=domain,
+        )
+        previous = (schedule,) if isinstance(schedule, Schedule) else tuple(schedule or ())
+        chain = previous + (item,)
+        info = (f"rows {rows}: {start_strength:g} \u2192 {end_strength:g} {curve} "
+                f"({domain} {start_percent:g}\u2013{end_percent:g}%)")
+        if curve == "explicit":
+            info += f", {len(item._explicit)} values"
+        return (chain, info)
+
+
 class H3LoraInspector:
     """Report the format, rank and adaLN basis of a LoRA without loading it."""
 
@@ -243,11 +310,13 @@ class H3LoraInspector:
 NODE_CLASS_MAPPINGS = {
     "H3PowerLoraStack": H3PowerLoraStack,
     "H3AdalnModality": H3AdalnModality,
+    "H3LoraSchedule": H3LoraSchedule,
     "H3LoraInspector": H3LoraInspector,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3PowerLoraStack": "MiniMax H3 Power LoRA Stack",
     "H3AdalnModality": "MiniMax H3 adaLN Modality",
+    "H3LoraSchedule": "MiniMax H3 LoRA Schedule",
     "H3LoraInspector": "MiniMax H3 LoRA Inspector",
 }

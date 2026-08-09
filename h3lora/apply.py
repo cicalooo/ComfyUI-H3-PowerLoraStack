@@ -6,6 +6,7 @@ import logging
 from collections import OrderedDict
 
 import comfy.lora
+import comfy.patcher_extension
 import comfy.utils
 from comfy.quant_ops import QuantizedTensor
 from comfy.weight_adapter import LoRAAdapter
@@ -15,6 +16,7 @@ from . import branch as branch_mod
 from . import gain
 from . import keymap
 from . import modality as modality_mod
+from . import schedule as schedule_mod
 
 LOG = logging.getLogger("h3.powerlorastack")
 
@@ -98,7 +100,7 @@ def detect_quantization(model_patcher) -> str:
 
 
 def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
-                report: StackReport | None = None, modality=None):
+                report: StackReport | None = None, modality=None, schedule=None):
     """Apply a list of ``{'path', 'name', 'strength'}`` LoRAs to an H3 model.
 
     ``mode`` is ``auto`` (branch quantized layers, merge the rest), ``merge``
@@ -142,9 +144,11 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
     per_module: "OrderedDict[str, list]" = OrderedDict()
     compute_dtype = model.model_dtype()
 
-    for entry in entries:
+    for fallback_row, entry in enumerate(entries, start=1):
+        row_index = int(entry.get("row", fallback_row))
         name = entry.get("name") or entry["path"]
         strength = float(entry.get("strength", 1.0))
+        row_schedule = schedule_mod.resolve(schedule, row_index)
         lora_sd = comfy.utils.load_torch_file(entry["path"], safe_load=True)
 
         normalized, unmatched = keymap.normalize(lora_sd, index)
@@ -171,25 +175,43 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
 
         loaded = comfy.lora.load_lora(normalized, key_map)
 
-        merge: dict = {}
+        merge: dict = dict(loaded)
         branched_here = 0
         for weight_key, adapter in loaded.items():
+            if not weight_key.endswith(".weight"):
+                continue
             module_path = weight_key[: -len(".weight")] if weight_key.endswith(".weight") else None
             if module_path is None or not _is_plain_lora(adapter):
-                merge[weight_key] = adapter
                 continue
             weight = _module_weight(patcher, module_path)
-            if not _branchable(weight, module_path, mode):
-                merge[weight_key] = adapter
+            effective_mode = "branch" if row_schedule is not None else mode
+            if not _branchable(weight, module_path, effective_mode):
                 continue
             up, down = adapter.weights[0], adapter.weights[1]
             if up.shape[0] != weight.shape[0] or down.shape[1] != weight.shape[1]:
                 LOG.warning("H3 PowerLoraStack: shape mismatch on %s, skipped", weight_key)
                 report.skipped += 1
+                merge.pop(weight_key, None)
                 continue
             alpha = adapter.weights[2]
-            scale = strength * (float(alpha) / down.shape[0] if alpha is not None else 1.0)
-            per_module.setdefault(module_path, []).append((up, down, scale))
+            alpha_scale = float(alpha) / down.shape[0] if alpha is not None else 1.0
+            bias = None
+            if row_schedule is not None:
+                bias_key = f"{module_path}.bias"
+                bias_patch = loaded.get(bias_key)
+                if (isinstance(bias_patch, tuple) and len(bias_patch) > 1
+                        and bias_patch[0] == "diff" and bias_patch[1]):
+                    candidate = bias_patch[1][0]
+                    if getattr(candidate, "ndim", None) == 1 and candidate.shape[0] == weight.shape[0]:
+                        bias = candidate
+                        merge.pop(bias_key, None)
+                per_module.setdefault(module_path, []).append(
+                    (up, down, alpha_scale, row_schedule, bias))
+            else:
+                # Preserve the original strength-folded contribution exactly.
+                per_module.setdefault(module_path, []).append(
+                    (up, down, strength * alpha_scale))
+            merge.pop(weight_key, None)
             branched_here += 1
 
         if merge:
@@ -201,6 +223,19 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
         if unmatched:
             detail += f", {len(unmatched)} unmatched"
         report.add(f"{name} @ {strength:g}: {detail}{adaln_note}{mod_note}")
+        if row_schedule is not None:
+            arrow = "\u2192"
+            report.add(
+                f"  sched: {row_schedule.start_strength:.2f} {arrow} "
+                f"{row_schedule.end_strength:.2f} {row_schedule.curve} "
+                f"({row_schedule.domain} {row_schedule.start_percent:g}\u2013"
+                f"{row_schedule.end_percent:g}%)"
+            )
+            if merge:
+                report.add(
+                    f"  ! {len(merge)} patches on {name} cannot be scheduled "
+                    f"(merged at {strength:.2f})"
+                )
         if measured.get("rel"):
             # what this LoRA actually does to the weights, so a strength that is
             # far off the calibrated unit is visible without the UI button
@@ -219,7 +254,13 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
         while patcher.get_additional_models_with_key(f"h3_power_lora_bank_{n}"):
             n += 1
         tag = f"h3_power_lora_bank_{n}"
-        branch_mod.attach(patcher, per_module, compute_dtype, tag)
+        _count, controller = branch_mod.attach(patcher, per_module, compute_dtype, tag)
+        if controller is not None:
+            patcher.add_wrapper_with_key(
+                comfy.patcher_extension.WrappersMP.APPLY_MODEL,
+                f"h3_lora_schedule_{n}",
+                controller,
+            )
         report.add(f"branch bank: {len(per_module)} layers, "
                    f"{report.bank_bytes / (1024 ** 2):.0f} MB")
 

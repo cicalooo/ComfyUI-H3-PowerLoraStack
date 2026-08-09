@@ -1,28 +1,14 @@
-"""Runtime low-rank branches for quantized MiniMax H3 weights.
+"""Exact, fused runtime low-rank branches for quantized MiniMax H3 weights.
 
-Merging a LoRA into a w4a8 / int4 weight destroys it.  ComfyUI's stock path is
-dequantize -> add delta -> ``requantize_from_float(scale="recalculate")``, and
-that round trip is not idempotent: re-fitting the codebook and re-rounding to
-int4 injects ~1.5% relative weight noise, while these deltas are 0.01-0.08% of
-the weight.  The merge therefore replaces the adapter with noise -- measured
-end to end it recovers under a third of the LoRA magnitude at cos 0.12-0.14
-against the correct result.
-
-Keeping the branch separate is exact, keeps the quantized kernel, and costs
-~1.5% extra FLOPs at rank 64.
-
-Stacking is fused: N LoRAs on one Linear become a single pair by concatenating
-along the rank axis,
-
-    sum_i s_i * B_i @ A_i @ x  ==  [s_1 B_1 | ... | s_N B_N] @ [A_1; ...; A_N] @ x
-
-so a ten-LoRA stack still costs one extra matmul pair per layer rather than
-ten, and only one set of factors has to be moved to the GPU.
+Unscheduled branches fold strength into ``up`` exactly as before. Scheduled
+branches retain one contiguous rank slice per LoRA and multiply the small
+rank-width intermediate at model-call time.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -30,35 +16,63 @@ import torch.nn.functional as F
 
 import comfy.model_management
 
+from .schedule import Schedule, ScheduleState, progress_from
+
+
+@dataclass
+class FusedBranch:
+    up: torch.Tensor
+    down: torch.Tensor
+    # rank start, rank end, schedule (None means constant), constant/alpha scale
+    slices: list[tuple[int, int, Schedule | None, float]]
+    biases: list[tuple[torch.Tensor, Schedule]]
+
 
 class LoraBank(nn.Module):
     """Holds every runtime branch's factors as one movable, accountable module."""
 
-    def __init__(self, pairs: "OrderedDict[str, tuple[torch.Tensor, torch.Tensor]]"):
+    def __init__(self, pairs):
         super().__init__()
         self.index: dict[str, int] = {}
-        for i, (name, (up, down)) in enumerate(pairs.items()):
+        self.scheduled: dict[str, FusedBranch] = {}
+        for i, (name, fused) in enumerate(pairs.items()):
+            if isinstance(fused, FusedBranch):
+                up, down = fused.up, fused.down
+                self.scheduled[name] = fused
+            else:
+                up, down = fused
             self.register_parameter(f"up{i}", nn.Parameter(up, requires_grad=False))
             self.register_parameter(f"down{i}", nn.Parameter(down, requires_grad=False))
+            if isinstance(fused, FusedBranch):
+                initial = torch.cat([
+                    torch.full(
+                        (end - start,),
+                        schedule.evaluate(0.0) * scale if schedule is not None else scale,
+                        dtype=up.dtype,
+                    )
+                    for start, end, schedule, scale in fused.slices
+                ])
+                self.register_buffer(f"scale{i}", initial, persistent=False)
+                if fused.biases:
+                    bias = torch.stack([item[0].to(up.dtype) for item in fused.biases])
+                    self.register_buffer(f"bias{i}", bias, persistent=False)
             self.index[name] = i
 
     def get(self, name: str):
         i = self.index[name]
         return getattr(self, f"up{i}"), getattr(self, f"down{i}")
 
+    def get_bias(self, name: str):
+        return getattr(self, f"bias{self.index[name]}", None)
+
 
 class LoraBranch:
-    """Object patch for a Linear's ``forward``: ``y = W_q(x) + up @ down @ x``.
+    """Object patch for ``Linear.forward`` with a live optional rank scale."""
 
-    Patches ``.forward`` rather than the module itself -- replacing the module
-    would shift the memory manager's ``named_modules`` keys.  Holds the
-    *patcher* rather than the bare module so comfy's weakref bookkeeping does
-    not report a leaked model.
-    """
-
-    def __init__(self, bank_patcher, name: str, original):
+    def __init__(self, bank_patcher, state: ScheduleState, name: str, original):
         self.bank_patcher = bank_patcher
         self.bank: LoraBank = bank_patcher.model
+        self.state = state
         self.name = name
         self.original = original
 
@@ -66,41 +80,110 @@ class LoraBranch:
         out = self.original(input, *args, **kwargs)
         up, down = self.bank.get(self.name)
         h = F.linear(input, comfy.model_management.cast_to_device(down, input.device, input.dtype))
+        scales = self.state.scales_for(self.name)
+        if scales is not None:
+            h = h * comfy.model_management.cast_to_device(
+                scales, input.device, input.dtype)
         delta = F.linear(h, comfy.model_management.cast_to_device(up, input.device, input.dtype))
+        bias = self.bank.get_bias(self.name)
+        bias_scales = self.state.bias_scales_for(self.name)
+        if bias is not None and bias_scales is not None:
+            bias = comfy.model_management.cast_to_device(bias, input.device, input.dtype)
+            bias_scales = comfy.model_management.cast_to_device(
+                bias_scales, input.device, input.dtype)
+            delta = delta + torch.matmul(bias_scales, bias)
         return out + delta.to(out.dtype)
 
 
 def fuse(contributions, compute_dtype):
-    """Concatenate per-LoRA ``(up, down, scale)`` triples into one pair.
+    """Fuse contributions, retaining rank boundaries only when scheduled."""
+    if all(len(item) == 3 for item in contributions):
+        # This is the original path, intentionally unchanged for bit identity.
+        ups, downs = [], []
+        for up, down, scale in contributions:
+            ups.append((up.to(torch.float32) * float(scale)).to(compute_dtype))
+            downs.append(down.to(compute_dtype))
+        if len(ups) == 1:
+            return ups[0], downs[0]
+        return torch.cat(ups, dim=1).contiguous(), torch.cat(downs, dim=0).contiguous()
 
-    The strength/alpha scale is folded into ``up`` so the forward path stays a
-    bare pair of matmuls.
-    """
-    ups, downs = [], []
-    for up, down, scale in contributions:
-        ups.append((up.to(torch.float32) * float(scale)).to(compute_dtype))
+    ups, downs, slices, biases = [], [], [], []
+    rank_start = 0
+    for item in contributions:
+        if len(item) == 3:
+            up, down, scale = item
+            schedule = None
+            bias = None
+        else:
+            up, down, scale, schedule, bias = item
+        rank_end = rank_start + down.shape[0]
+        ups.append(up.to(compute_dtype))
         downs.append(down.to(compute_dtype))
-    if len(ups) == 1:
-        return ups[0], downs[0]
-    return torch.cat(ups, dim=1).contiguous(), torch.cat(downs, dim=0).contiguous()
+        slices.append((rank_start, rank_end, schedule, float(scale)))
+        if bias is not None:
+            biases.append((bias, schedule))
+        rank_start = rank_end
+    up = ups[0] if len(ups) == 1 else torch.cat(ups, dim=1).contiguous()
+    down = downs[0] if len(downs) == 1 else torch.cat(downs, dim=0).contiguous()
+    return FusedBranch(up, down, slices, biases)
+
+
+class ScheduleController:
+    """Stackable APPLY_MODEL wrapper publishing scales for one bank."""
+
+    def __init__(self, state: ScheduleState, scheduled: dict[str, FusedBranch], dtype):
+        self.state = state
+        self.scheduled = scheduled
+        self.dtype = dtype
+
+    def __call__(self, executor, x, t, c_concat=None, c_crossattn=None, control=None,
+                 transformer_options=None, **kwargs):
+        transformer_options = transformer_options or {}
+        scales, bias_scales = {}, {}
+        progress_cache = {}
+        device = torch.as_tensor(t).device
+
+        def strength(schedule):
+            progress = progress_cache.setdefault(
+                schedule.domain, progress_from(t, transformer_options, schedule.domain))
+            return schedule.evaluate(progress)
+
+        for name, fused in self.scheduled.items():
+            scales[name] = torch.cat([
+                torch.full(
+                    (end - start,),
+                    strength(schedule) * factor if schedule is not None else factor,
+                    dtype=self.dtype,
+                    device=device,
+                )
+                for start, end, schedule, factor in fused.slices
+            ])
+            if fused.biases:
+                bias_scales[name] = torch.tensor(
+                    [strength(schedule) for _bias, schedule in fused.biases],
+                    dtype=self.dtype,
+                    device=device,
+                )
+        self.state.set(scales, bias_scales)
+        try:
+            return executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
+        finally:
+            self.state.clear()
 
 
 def attach(model_patcher, per_module, compute_dtype, tag: str):
-    """Build the bank, register it for VRAM accounting, patch every forward.
-
-    ``per_module`` maps a module path to a list of ``(up, down, scale)``.
-    Returns the number of branched layers.
-    """
+    """Build the bank, register it for VRAM accounting, and patch forwards."""
     if not per_module:
-        return 0
+        return 0, None
 
     import comfy.model_patcher
 
-    pairs: "OrderedDict[str, tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
-    for module_path, contributions in per_module.items():
-        pairs[module_path] = fuse(contributions, compute_dtype)
-
+    pairs = OrderedDict(
+        (module_path, fuse(contributions, compute_dtype))
+        for module_path, contributions in per_module.items()
+    )
     bank = LoraBank(pairs)
+    state = ScheduleState()
     bank_patcher = comfy.model_patcher.ModelPatcher(
         bank,
         load_device=comfy.model_management.get_torch_device(),
@@ -111,8 +194,10 @@ def attach(model_patcher, per_module, compute_dtype, tag: str):
     for module_path in pairs:
         forward_key = f"{module_path}.forward"
         original = model_patcher.get_model_object(forward_key)
-        model_patcher.add_object_patch(forward_key, LoraBranch(bank_patcher, module_path, original))
-    return len(pairs)
+        model_patcher.add_object_patch(
+            forward_key, LoraBranch(bank_patcher, state, module_path, original))
+    controller = ScheduleController(state, bank.scheduled, compute_dtype) if bank.scheduled else None
+    return len(pairs), controller
 
 
 def bank_bytes(per_module, compute_dtype) -> int:
@@ -120,6 +205,9 @@ def bank_bytes(per_module, compute_dtype) -> int:
     itemsize = torch.empty((), dtype=compute_dtype).element_size()
     total = 0
     for contributions in per_module.values():
-        for up, down, _ in contributions:
+        for item in contributions:
+            up, down = item[:2]
             total += (up.numel() + down.numel()) * itemsize
+            if len(item) > 3 and item[4] is not None:
+                total += item[4].numel() * itemsize
     return total
