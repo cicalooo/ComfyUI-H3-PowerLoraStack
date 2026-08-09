@@ -16,32 +16,22 @@ const ROW_FORMAT_KEY = "h3RowFormat";
 const ROW_FORMAT = 2;
 const LEGACY_BUTTON_SLOTS = 3;
 
-// Session cache for the loras folder listing.  Deliberately a module global
-// rather than graph.extra: anything hung off the graph is serialized into the
-// saved workflow, which would bake a stale copy of the whole folder into every
-// .json.  The promise itself is cached so N rows opening at once share one
-// request.
-let loraListPromise = null;
-
 /**
  * The stack node declares no ``lora_name`` input of its own -- rows are added
- * in the browser -- so the folder listing is borrowed from a node that does.
+ * in the browser -- so the current folder listing is borrowed from a node that
+ * does each time the picker opens.
  */
 function fetchLoraList() {
-  if (!loraListPromise) {
-    loraListPromise = api
-      .fetchApi("/object_info/LoraLoaderModelOnly")
-      .then((res) => res.json())
-      .then(
-        (info) => info?.LoraLoaderModelOnly?.input?.required?.lora_name?.[0] ?? []
-      )
-      .catch((err) => {
-        console.warn("[H3PowerLoraStack] could not fetch lora list", err);
-        loraListPromise = null;   // let the next picker retry
-        return [];
-      });
-  }
-  return loraListPromise;
+  return api
+    .fetchApi("/object_info/LoraLoaderModelOnly")
+    .then((res) => res.json())
+    .then(
+      (info) => info?.LoraLoaderModelOnly?.input?.required?.lora_name?.[0] ?? []
+    )
+    .catch((err) => {
+      console.warn("[H3PowerLoraStack] could not fetch lora list", err);
+      return [];
+    });
 }
 
 /**
