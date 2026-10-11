@@ -18,6 +18,8 @@ head.
 | **MiniMax H3 LoRA Schedule** | Varies selected stack rows' strength over denoising steps or normalized sigma |
 | **MiniMax H3 LoRA Inspector** | Reports a LoRA's format, rank and adaLN basis without loading it |
 
+The stack row UI matured from [rgthree-comfy](https://github.com/rgthree/rgthree-comfy)'s Power Lora Loader.
+
 ## Good to know
 
 - **AdaLN port — 8 Aug 2026, commit `28ac439`.** This stack rebases dense↔curve
@@ -132,9 +134,9 @@ alibaba-pai Acc LoRAs ship a 32-interval output-head bank as
 `final_layer.video_out.set_weight` of shape `[3072, 5376]` (`32 × 96`) plus the
 audio twin. Stock Comfy `copy_`s that onto the native `[96, 5376]` head and
 crashes. This node peels those tensors before the stock `set` path and blends
-the heads the sampler step spans with Core's rule (PR 15908): row 0 is the
-full head and later rows are offsets from it. Original `proj_out` banks are
-full heads, so those are converted to that layout first. Row strength
+the heads the sampler step spans: row 0 is the full head and later rows are
+offsets from it. Original `proj_out` banks are full heads, so those are
+converted to that layout first. Row strength
 interpolates between native and blended heads; schedules multiply that
 strength. Use `simple` at 8 steps with shifts 12/3 so steps land on the trained
 grid. Later stack rows that also carry a bank replace the earlier one.

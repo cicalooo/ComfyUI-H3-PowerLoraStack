@@ -1,3 +1,4 @@
+// Stack row UI matured from rgthree-comfy's Power Lora Loader.
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 

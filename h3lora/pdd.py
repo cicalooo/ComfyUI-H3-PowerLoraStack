@@ -2,15 +2,14 @@
 
 alibaba-pai Acc LoRAs store a 32-interval bank as ``final_layer.video_out.set_weight``
 of shape ``[N * 96, hidden]`` (and the audio twin). Stock Comfy ``copy_``s that
-onto the native ``[96, hidden]`` head and crashes. Core PR 15908 teaches
-``FinalLayer`` to blend those rows; this module does the same inside the Power
-LoRA Stack so those files load without a core change.
+onto the native ``[96, hidden]`` head and crashes, so this module peels the bank
+and blends it at sample time.
 
-Core's layout is not a stack of full heads. Row 0 is the full head and every
-later row is an offset from it. A step is ``rows[0] + dt-weighted mean of the
-offsets it spans``. Comfy ``set_weight`` files are already in that layout.
-Original ``proj_out`` / ``audio_proj_out`` banks are full heads, so those are
-converted to offsets before the same blend.
+The layout is not a stack of full heads. Row 0 is the full head and every later
+row is an offset from it. A step is ``rows[0] + dt-weighted mean of the offsets
+it spans``. ``set_weight`` files are already in that layout. Original
+``proj_out`` / ``audio_proj_out`` banks are full heads, so those are converted
+to offsets before the same blend.
 
 The bank is kept beside the model (object patch + DIFFUSION_MODEL wrapper) and
 is registered as an additional model so ComfyUI can move and account for it.
@@ -55,8 +54,8 @@ _AUDIO_BIAS = (
     "final_layer.audio_out.set_bias",
     "audio_proj_out.bias",
 )
-# Original alibaba files store one absolute head per interval. Comfy's
-# set_weight files already use Core's row-0-plus-offsets layout.
+# Original alibaba files store one absolute head per interval.
+# set_weight files are already row 0 plus offsets.
 _FULL_HEAD_KEYS = frozenset((
     "proj_out.weight",
     "proj_out.bias",
@@ -201,10 +200,10 @@ def peel(sd, video_dim, audio_dim, hidden):
 
 
 def _blend(weight, bias, h, n, start, stop, flow_shift):
-    """Core PR 15908 head: row 0 is the full head, later rows are offsets.
+    """Row 0 is the full head, later rows are offsets.
 
-    Matches ``comfy.ldm.minimax.model._pdd_head``. Interval 0's dt weight is
-    not applied to an offset; adding row 0 unweighted is that interval's share.
+    Interval 0's dt weight is not applied to an offset; adding row 0 unweighted
+    is that interval's share.
     """
     start = max(0, min(n - 1, int(start)))
     stop = max(start + 1, min(n, int(stop)))
