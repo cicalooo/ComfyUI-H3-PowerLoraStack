@@ -113,6 +113,59 @@ class BlendTests(unittest.TestCase):
         self.assertTrue(torch.allclose(video, native + 0.5 * (pdd - native)))
         self.assertEqual(audio.shape, (2, 1))
 
+    def test_current_comfy_signature_prefers_direct_schedule_arguments(self):
+        class StaticAdaln(nn.Module):
+            def forward(self, _t):
+                return torch.zeros(2, 3), torch.zeros(2, 3)
+
+        inner = SimpleNamespace(
+            norm=nn.Identity(),
+            adaln_proj=StaticAdaln(),
+            video_out=nn.Linear(3, 2),
+            audio_out=nn.Linear(3, 1),
+        )
+        video_bank = torch.cat([
+            torch.full((2, 3), float(head))
+            for head in (1, 2, 3, 4)
+        ])
+        bank, _ = peel({
+            "final_layer.video_out.set_weight": video_bank,
+        }, 2, 1, 3)
+
+        state = PddState(1.0, None)
+        # Deliberately unusable legacy schedule data: direct arguments from
+        # current ComfyUI must take precedence, while strength still comes from
+        # the outer stack wrapper's state.
+        state.set(torch.tensor(0.5), torch.empty(0), (1.0, 1.0), 1.0)
+        layer = PddFinalLayer(inner, PddBank(bank), state)
+
+        sigma = torch.tensor(1.0)
+        sample_sigmas = torch.tensor([1.0, 0.0])
+        shifts = (12.0, 3.0)
+        x = torch.ones(4, 3)
+        video, audio = layer(
+            x,
+            torch.zeros(1, 3),
+            (0, 2, 0),
+            (2, 4, 1),
+            sigma,
+            sample_sigmas,
+            shifts,
+        )
+
+        start, stop = interval(sigma, sample_sigmas[1], 4, shifts[0])
+        expected_video = _blend(
+            layer.bank.video_w,
+            layer.bank.video_b,
+            x[:2],
+            4,
+            start,
+            stop,
+            shifts[0],
+        )
+        self.assertTrue(torch.allclose(video, expected_video))
+        self.assertEqual(audio.shape, (2, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

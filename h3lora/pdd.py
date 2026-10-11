@@ -201,16 +201,34 @@ class PddFinalLayer(nn.Module):
         self.video_out = inner.video_out
         self.audio_out = inner.audio_out
 
-    def forward(self, x, t_emb, video_seg, audio_seg):
+    def forward(self, x, t_emb, video_seg, audio_seg,
+                sigma=None, sample_sigmas=None, shifts=None):
+        """Run PDD under both current and legacy MiniMax H3 final-layer ABIs.
+
+        Current ComfyUI passes sigma, the sampler schedule, and stream shifts
+        directly. Older cores expose only the first four arguments, so retain
+        the outer wrapper's thread-local values as a compatibility fallback.
+        """
         inner = self.inner
         bank = self.bank
         ctx = self.ctx
         n = bank.n
-        sample_sigmas = ctx.get("sample_sigmas")
-        sigma = ctx.get("sigma")
+
+        if sigma is None:
+            sigma = ctx.get("sigma")
+        if sample_sigmas is None:
+            sample_sigmas = ctx.get("sample_sigmas")
+        if shifts is None:
+            shifts = ctx.get("shifts")
+        if shifts is None:
+            shifts = (12.0, 3.0)
         if sample_sigmas is None or sigma is None:
             raise ValueError("MiniMax H3 PDD heads need the sampler's sigma schedule")
-        sample_sigmas = torch.as_tensor(sample_sigmas, device=sigma.device).flatten()
+
+        sigma = torch.as_tensor(sigma)
+        sample_sigmas = torch.as_tensor(
+            sample_sigmas, device=sigma.device
+        ).flatten()
         if sample_sigmas.numel() == 0:
             raise ValueError("MiniMax H3 PDD heads need a non-empty sigma schedule")
 
@@ -223,8 +241,10 @@ class PddFinalLayer(nn.Module):
 
         i = int((sample_sigmas - sigma).abs().argmin())
         sigma_next = sample_sigmas[min(i + 1, sample_sigmas.shape[0] - 1)]
-        shifts = ctx.get("shifts") or (12.0, 3.0)
-        strength = float(ctx.get("strength") or 0.0)
+        strength = ctx.get("strength")
+        if strength is None:
+            strength = ctx.default_strength
+        strength = float(strength)
         start, stop = interval(sigma, sigma_next, n, shifts[0])
         vh = mod(video_seg)
         ah = mod(audio_seg)

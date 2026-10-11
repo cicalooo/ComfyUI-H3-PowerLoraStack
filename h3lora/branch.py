@@ -18,6 +18,11 @@ import comfy.model_management
 
 from .schedule import Schedule, ScheduleState, progress_from
 
+# A full-sequence LoRA residual is a second activation the size of fc1/qkv.
+# Above this, apply the branch in token slices so that add does not OOM a 24 GB card.
+_WHOLE_RESIDUAL_MAX_BYTES = 256 << 20
+_RESIDUAL_SLICE_BYTES = 64 << 20
+
 
 @dataclass
 class FusedBranch:
@@ -76,8 +81,17 @@ class LoraBranch:
         self.name = name
         self.original = original
 
-    def __call__(self, input: torch.Tensor, *args, **kwargs):
-        out = self.original(input, *args, **kwargs)
+    def _bias_term(self, input: torch.Tensor):
+        bias = self.bank.get_bias(self.name)
+        bias_scales = self.state.bias_scales_for(self.name)
+        if bias is None or bias_scales is None:
+            return None
+        bias = comfy.model_management.cast_to_device(bias, input.device, input.dtype)
+        bias_scales = comfy.model_management.cast_to_device(
+            bias_scales, input.device, input.dtype)
+        return torch.matmul(bias_scales, bias)
+
+    def _residual_whole(self, input: torch.Tensor, out: torch.Tensor):
         up, down = self.bank.get(self.name)
         h = F.linear(input, comfy.model_management.cast_to_device(down, input.device, input.dtype))
         scales = self.state.scales_for(self.name)
@@ -85,14 +99,46 @@ class LoraBranch:
             h = h * comfy.model_management.cast_to_device(
                 scales, input.device, input.dtype)
         delta = F.linear(h, comfy.model_management.cast_to_device(up, input.device, input.dtype))
-        bias = self.bank.get_bias(self.name)
-        bias_scales = self.state.bias_scales_for(self.name)
-        if bias is not None and bias_scales is not None:
-            bias = comfy.model_management.cast_to_device(bias, input.device, input.dtype)
-            bias_scales = comfy.model_management.cast_to_device(
-                bias_scales, input.device, input.dtype)
-            delta = delta + torch.matmul(bias_scales, bias)
-        return out + delta.to(out.dtype)
+        bias_term = self._bias_term(input)
+        if bias_term is not None:
+            delta = delta + bias_term
+        if out.requires_grad:
+            return out + delta.to(out.dtype)
+        return out.add_(delta.to(out.dtype))
+
+    def __call__(self, input: torch.Tensor, *args, **kwargs):
+        out = self.original(input, *args, **kwargs)
+        # A full-sequence residual is a second activation the size of fc1/qkv.
+        # On a 24 GB card that add is the OOM. Rows are independent, so apply
+        # the branch in slices and accumulate into the linear output.
+        if (
+            out.requires_grad
+            or input.ndim < 2
+            or input.shape[0] != out.shape[0]
+            or out.numel() * out.element_size() <= _WHOLE_RESIDUAL_MAX_BYTES
+        ):
+            return self._residual_whole(input, out)
+        up, down = self.bank.get(self.name)
+        down_w = comfy.model_management.cast_to_device(down, input.device, input.dtype)
+        up_w = comfy.model_management.cast_to_device(up, input.device, input.dtype)
+        scales = self.state.scales_for(self.name)
+        if scales is not None:
+            scales = comfy.model_management.cast_to_device(scales, input.device, input.dtype)
+        # [out], broadcast onto every token. Sequence length can equal the
+        # output width, so slicing this on dim 0 would hit the wrong axis.
+        bias_term = self._bias_term(input)
+        step = max(1, _RESIDUAL_SLICE_BYTES // max(1, out.shape[-1] * out.element_size()))
+        rows = out.shape[0]
+        for start in range(0, rows, step):
+            stop = min(start + step, rows)
+            h = F.linear(input[start:stop], down_w)
+            if scales is not None:
+                h = h * scales
+            delta = F.linear(h, up_w)
+            if bias_term is not None:
+                delta = delta + bias_term
+            out[start:stop].add_(delta.to(out.dtype))
+        return out
 
 
 def fuse(contributions, compute_dtype):

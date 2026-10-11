@@ -3,6 +3,7 @@ import unittest
 
 import torch
 
+import h3lora.branch as branch_mod
 from h3lora.branch import FusedBranch, LoraBank, LoraBranch, ScheduleController, fuse
 from h3lora.schedule import Schedule, ScheduleState
 
@@ -61,6 +62,36 @@ class BranchScheduleTests(unittest.TestCase):
         self.assertEqual(result, (0.0, 2.0))
         self.assertIsNone(state_a.scales_for("a"))
         self.assertIsNone(state_b.scales_for("b"))
+
+    def test_chunked_bias_broadcasts_when_seq_equals_out(self):
+        # bias_term is [out], not [seq]. When those lengths match, slicing the
+        # bias on dim 0 looks like a row slice and corrupts every token.
+        seq = out = 6
+        rank, hidden = 2, 3
+        up = torch.zeros(out, rank)
+        up[:, 0] = 1.0
+        down = torch.zeros(rank, hidden)
+        down[0, 0] = 1.0
+        bias = torch.arange(1, out + 1, dtype=torch.float32)
+        fused = fuse([(up, down, 1.0, None, bias)], torch.float32)
+        bank = LoraBank(OrderedDict([("layer", fused)]))
+        state = ScheduleState()
+        state.set({"layer": torch.ones(rank)}, {"layer": torch.ones(1)})
+
+        def original(value):
+            return torch.zeros(value.shape[0], out)
+
+        branch = LoraBranch(_BankPatcher(bank), state, "layer", original)
+        old_min, old_slice = branch_mod._WHOLE_RESIDUAL_MAX_BYTES, branch_mod._RESIDUAL_SLICE_BYTES
+        branch_mod._WHOLE_RESIDUAL_MAX_BYTES = 0
+        branch_mod._RESIDUAL_SLICE_BYTES = 1
+        try:
+            got = branch(torch.ones(seq, hidden))
+        finally:
+            branch_mod._WHOLE_RESIDUAL_MAX_BYTES = old_min
+            branch_mod._RESIDUAL_SLICE_BYTES = old_slice
+        expected = (1.0 + bias).expand(seq, out)
+        self.assertTrue(torch.allclose(got, expected))
 
 
 if __name__ == "__main__":
