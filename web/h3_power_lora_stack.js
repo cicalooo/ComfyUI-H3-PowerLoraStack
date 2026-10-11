@@ -9,12 +9,10 @@ const BALANCE_ROUTE = "/h3_power_lora_stack/balance";
 const BALANCE_LABEL = "⚖ Auto-balance strengths";
 const RESTORE_LABEL = "↺ Restore manual strengths";
 
-// Layout of the serialized widgets_values array.  Format 1 ended with one slot
-// per button; format 2 marks the buttons serialize:false and stops at the rows.
-// Stamped into node.properties so a reload can tell the two apart.
-const ROW_FORMAT_KEY = "h3RowFormat";
-const ROW_FORMAT = 2;
-const LEGACY_BUTTON_SLOTS = 3;
+// Canonical row list. ComfyUI's configure() runs migrateWidgetsValues before
+// onConfigure and drops widgets_values slots that line up with serialize:false
+// buttons, so the stack is snapshotted here and rebuilt after that migrator.
+const ROWS_KEY = "h3Rows";
 
 /**
  * The stack node declares no ``lora_name`` input of its own -- rows are added
@@ -83,6 +81,9 @@ function makeLoraWidget(node, name, value) {
     name,
     type: "H3_LORA",
     value: Object.assign({ on: true, lora: "None", strength: 1.0 }, value || {}),
+    // Widget-level flag, not only options.serialize. The frontend skips a row
+    // when `serialize === false`; undefined is kept, but be explicit.
+    serialize: true,
     options: { serialize: true },
     hitAreas: {},
 
@@ -181,6 +182,7 @@ function makeLoraWidget(node, name, value) {
       if (hit(this.hitAreas.toggle)) {
         this.value = { ...this.value, on: !this.value.on };
         node_.setDirtyCanvas(true, true);
+        markChanged(node_);
         // a row switched on inside a balanced stack has not been measured yet
         if (this.value.on && isBalanced(node_)) applyBalance(node_);
         return true;
@@ -224,6 +226,7 @@ function makeLoraWidget(node, name, value) {
     setStrength(node_, value) {
       this.value = { ...this.value, strength: value, autoApplied: false };
       node_.setDirtyCanvas(true, true);
+      markChanged(node_);
     },
 
     serializeValue() {
@@ -382,6 +385,7 @@ async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}
     }
     widget.value = next;
     node.setDirtyCanvas(true, true);
+    markChanged(node);
     close();
     if (wasBalanced) applyBalance(node);
   };
@@ -486,6 +490,65 @@ function isRowValue(v) {
   return !!v && typeof v === "object" && !Array.isArray(v) && "lora" in v;
 }
 
+function copyRow(v) {
+  return { ...v };
+}
+
+function rowsFromList(values) {
+  if (Array.isArray(values)) return values.filter(isRowValue).map(copyRow);
+  if (values && typeof values === "object") {
+    return Object.values(values).filter(isRowValue).map(copyRow);
+  }
+  return [];
+}
+
+/** Named slots are `lora_N`. Anything else that still looks like a row sorts last. */
+function rowsFromNamed(named) {
+  if (!named || typeof named !== "object" || Array.isArray(named)) return [];
+  const order = (key) => {
+    const match = /^lora_(\d+)$/.exec(key);
+    return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+  };
+  return Object.keys(named)
+    .filter((key) => isRowValue(named[key]))
+    .sort((a, b) => order(a) - order(b) || (a < b ? -1 : a > b ? 1 : 0))
+    .map((key) => copyRow(named[key]));
+}
+
+/**
+ * Row list to rebuild after configure. properties.h3Rows wins once a graph has
+ * been saved by this version; older graphs still carry the rows in
+ * widgets_values, which must be read before migrateWidgetsValues compacts them.
+ */
+function extractRows(info) {
+  if (!info || typeof info !== "object") return [];
+  const stored = info.properties?.[ROWS_KEY];
+  if (Array.isArray(stored)) return stored.filter(isRowValue).map(copyRow);
+  const positional = rowsFromList(info.widgets_values);
+  if (positional.length) return positional;
+  return rowsFromNamed(info.widgets_values_named);
+}
+
+function hasRowPayload(info) {
+  if (!info || typeof info !== "object") return false;
+  return (
+    Array.isArray(info.properties?.[ROWS_KEY]) ||
+    info.widgets_values != null ||
+    info.widgets_values_named != null
+  );
+}
+
+function syncProperties(node) {
+  node.properties = node.properties || {};
+  node.properties[ROWS_KEY] = loraWidgets(node).map((w) => copyRow(w.value));
+}
+
+/** Persist the row list and tell LiteGraph the graph changed, so autosave runs. */
+function markChanged(node) {
+  syncProperties(node);
+  node.graph?.change?.();
+}
+
 /* --------------------------------------------------------------- balance -- */
 
 function activeRows(node) {
@@ -578,6 +641,7 @@ async function applyBalance(node, { force = false } = {}) {
   }
   updateBalanceLabel(node);
   node.setDirtyCanvas(true, true);
+  markChanged(node);
 }
 
 /** Hand every row back the strength it had before auto-balance touched it. */
@@ -596,6 +660,7 @@ function restoreManual(node) {
   }
   updateBalanceLabel(node);
   node.setDirtyCanvas(true, true);
+  if (restored) markChanged(node);
   return restored;
 }
 
@@ -605,7 +670,7 @@ function renumber(node) {
   });
 }
 
-function addLoraWidget(node, value) {
+function addLoraWidget(node, value, { notify = true } = {}) {
   const widget = makeLoraWidget(node, `lora_${loraWidgets(node).length + 1}`, value);
   node.widgets = node.widgets || [];
   // keep the "Add LoRA" button last
@@ -614,15 +679,29 @@ function addLoraWidget(node, value) {
   else node.widgets.push(widget);
   renumber(node);
   resize(node);
+  if (notify) markChanged(node);
   return widget;
 }
 
-function removeLoraWidget(node, widget) {
+function removeLoraWidget(node, widget, { notify = true } = {}) {
   const i = node.widgets.indexOf(widget);
   if (i >= 0) node.widgets.splice(i, 1);
   renumber(node);
   resize(node);
   node.setDirtyCanvas(true, true);
+  if (notify) markChanged(node);
+}
+
+/**
+ * Rebuild the stack from a snapshot taken before configure. notify stays off:
+ * loading a graph is not an edit, and graph.change() here would dirty a fresh load.
+ */
+function restoreRows(node, rows) {
+  for (const w of [...loraWidgets(node)]) removeLoraWidget(node, w, { notify: false });
+  for (const row of rows) addLoraWidget(node, row, { notify: false });
+  updateBalanceLabel(node);
+  syncProperties(node);
+  resize(node);
 }
 
 function resize(node) {
@@ -643,8 +722,6 @@ app.registerExtension({
     nodeType.prototype.onNodeCreated = function () {
       onCreated?.apply(this, arguments);
       this.serialize_widgets = true;
-      this.properties = this.properties || {};
-      this.properties[ROW_FORMAT_KEY] = ROW_FORMAT;
 
       // (value, canvas, node, pos, event) -- the event is the pointerdown that
       // started the click, so the picker opens right under the button.
@@ -668,43 +745,35 @@ app.registerExtension({
       });
       restore.h3Role = "restore";
 
-      // The buttons hold no state, and leaving them in widgets_values is what
-      // made the stack grow: LiteGraph restores that array positionally over
-      // the widgets that exist before onConfigure runs -- the two combos and
-      // these three buttons -- so the first three saved rows landed in the
-      // buttons' `value`, were written back out on the next save, and came
-      // home as three extra rows on every load or clone.  Opting out of
-      // serialization drops them from both halves of that round trip.
+      // The buttons hold no state. Leaving them in widgets_values made the stack
+      // grow: positional restore wrote saved rows into the buttons, and the next
+      // save echoed them back as extra rows. serialize:false stops that, but
+      // ComfyUI's migrateWidgetsValues then treats those button slots as holes
+      // and drops the first rows. Restore happens in configure, from a snapshot
+      // taken before that migrator runs — not from the stripped array.
       for (const button of [add, balance, restore]) button.serialize = false;
 
       resize(this);
     };
 
-    const onConfigure = nodeType.prototype.onConfigure;
-    nodeType.prototype.onConfigure = function (info) {
-      onConfigure?.apply(this, arguments);
-      // ComfyUI restores widgets_values positionally against the widgets that
-      // existed before this ran, which is only the fixed combos and the
-      // buttons.  The stack rows are recovered by shape instead of position,
-      // so a slot shifting cannot corrupt them.
-      const values = info?.widgets_values;
-      if (!Array.isArray(values)) return;
-      // Format 1 kept a trailing slot per button, and any workflow saved after
-      // one of those buttons had absorbed a row carries that row twice.  The
-      // button slots are always the last three, so a format-1 array is trimmed
-      // back to the rows; format 2 no longer writes them at all.
-      const format = info?.properties?.[ROW_FORMAT_KEY] ?? 1;
-      const slots =
-        format >= ROW_FORMAT
-          ? values
-          : values.slice(0, Math.max(0, values.length - LEGACY_BUTTON_SLOTS));
-      const rows = slots.filter(isRowValue);
-      this.properties = this.properties || {};
-      this.properties[ROW_FORMAT_KEY] = ROW_FORMAT;   // re-save in the new shape
-      for (const w of loraWidgets(this)) removeLoraWidget(this, w);
-      for (const row of rows) addLoraWidget(this, row);
-      updateBalanceLabel(this);   // rows carry the balance state, so recover it
-      resize(this);
+    // Wrap configure, not onConfigure. ComfyNode.configure compacts
+    // widgets_values before it calls super, and super calls onConfigure.
+    const origConfigure = nodeType.prototype.configure;
+    nodeType.prototype.configure = function (info) {
+      const captured = hasRowPayload(info) ? extractRows(info) : null;
+      const result = origConfigure?.apply(this, arguments);
+      if (captured !== null) restoreRows(this, captured);
+      return result;
+    };
+
+    const origSerialize = nodeType.prototype.onSerialize;
+    nodeType.prototype.onSerialize = function (info) {
+      origSerialize?.apply(this, arguments);
+      syncProperties(this);
+      if (info && typeof info === "object") {
+        info.properties = info.properties || {};
+        info.properties[ROWS_KEY] = loraWidgets(this).map((w) => copyRow(w.value));
+      }
     };
   },
 });
