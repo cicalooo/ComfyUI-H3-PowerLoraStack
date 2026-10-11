@@ -129,7 +129,8 @@ class H3PowerLoraStack:
     * adaLN basis mismatch -- LoRAs trained against a dense checkpoint are
       rebased onto a pruned checkpoint's curve, instead of being skipped;
     * Acc/PDD head banks -- ``video_out.set_weight`` of shape ``[N*96, hidden]``
-      is peeled off before the stock ``set`` path and blended per sampler step;
+      is peeled off before the stock ``set`` path and blended per sampler step
+      as row 0 plus offsets, matching Core;
     * key conventions -- ai-toolkit, kohya, lycoris, peft and bare-prefix
       layouts all resolve against the model's own key set.
     """

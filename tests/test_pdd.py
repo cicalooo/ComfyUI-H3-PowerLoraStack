@@ -4,15 +4,17 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from h3lora.pdd import PddBank, PddFinalLayer, PddState, _as_bank, _blend, interval, peel
+from h3lora.pdd import PddBank, PddFinalLayer, PddState, _as_bank, _blend, _to_offsets, interval, peel
 
 
 class PeelTests(unittest.TestCase):
     def test_stacked_set_weight(self):
+        video = torch.randn(3072, 5376)
+        audio = torch.randn(1024, 5376)
         sd = {
-            "diffusion_model.final_layer.video_out.set_weight": torch.randn(3072, 5376),
+            "diffusion_model.final_layer.video_out.set_weight": video,
             "diffusion_model.final_layer.video_out.set_bias": torch.randn(3072),
-            "diffusion_model.final_layer.audio_out.set_weight": torch.randn(1024, 5376),
+            "diffusion_model.final_layer.audio_out.set_weight": audio,
             "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight": torch.randn(8, 5376),
         }
         bank, note = peel(sd, 96, 32, 5376)
@@ -20,16 +22,24 @@ class PeelTests(unittest.TestCase):
         self.assertEqual(bank["n"], 32)
         self.assertEqual(bank["video_w"].shape, (3072, 5376))
         self.assertEqual(bank["audio_w"].shape, (1024, 5376))
+        # set_weight is already row 0 plus offsets; do not subtract again.
+        self.assertTrue(torch.equal(bank["video_w"], video))
+        self.assertTrue(torch.equal(bank["audio_w"], audio))
+        self.assertNotIn("offsets", note)
         self.assertIn("n=32", note)
         self.assertNotIn("set_weight", sd)
         self.assertIn("diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight", sd)
 
     def test_proj_out_3d(self):
+        video = torch.randn(32, 96, 5376)
+        video_b = torch.randn(32, 96)
+        audio = torch.randn(32, 32, 5376)
+        audio_b = torch.randn(32, 32)
         sd = {
-            "proj_out.weight": torch.randn(32, 96, 5376),
-            "proj_out.bias": torch.randn(32, 96),
-            "audio_proj_out.weight": torch.randn(32, 32, 5376),
-            "audio_proj_out.bias": torch.randn(32, 32),
+            "proj_out.weight": video.clone(),
+            "proj_out.bias": video_b.clone(),
+            "audio_proj_out.weight": audio.clone(),
+            "audio_proj_out.bias": audio_b.clone(),
         }
         bank, note = peel(sd, 96, 32, 5376)
         self.assertEqual(bank["n"], 32)
@@ -37,6 +47,14 @@ class PeelTests(unittest.TestCase):
         self.assertEqual(bank["video_b"].shape, (3072,))
         self.assertEqual(bank["audio_w"].shape, (1024, 5376))
         self.assertFalse(sd)
+        self.assertIn("video full heads stored as offsets", note)
+        self.assertIn("audio full heads stored as offsets", note)
+        self.assertTrue(torch.allclose(
+            bank["video_w"], _to_offsets(video.reshape(3072, 5376), 96)))
+        self.assertTrue(torch.allclose(
+            bank["video_b"], _to_offsets(video_b.reshape(3072), 96)))
+        self.assertTrue(torch.allclose(
+            bank["audio_w"], _to_offsets(audio.reshape(1024, 5376), 32)))
 
     def test_native_head_left_alone(self):
         w = torch.randn(96, 5376)
@@ -64,15 +82,53 @@ class BlendTests(unittest.TestCase):
         self.assertEqual(n2, 2)
         self.assertTrue(torch.equal(flat, flat2))
 
-    def test_single_interval_is_that_head(self):
+    def test_single_later_interval_is_base_plus_offset(self):
+        n, o, hidden = 4, 2, 3
+        weight = torch.zeros(n * o, hidden)
+        bias = torch.zeros(n * o)
+        for i in range(n):
+            weight[i * o:(i + 1) * o] = float(i + 1)
+            bias[i * o:(i + 1) * o] = float(i + 1)
+        h = torch.ones(5, hidden)
+        out = _blend(weight, bias, h, n, 2, 3, 1.0)
+        # row 0 is 1, row 2 is an offset of 3, so the head is 4.
+        self.assertEqual(out.shape, (5, o))
+        self.assertTrue(torch.allclose(out, torch.full((5, o), 4.0 * hidden + 4.0)))
+
+    def test_opening_interval_is_row_zero(self):
         n, o, hidden = 4, 2, 3
         weight = torch.zeros(n * o, hidden)
         for i in range(n):
             weight[i * o:(i + 1) * o] = float(i + 1)
-        h = torch.ones(5, hidden)
-        out = _blend(weight, None, h, n, 2, 3, 1.0)
-        self.assertEqual(out.shape, (5, o))
-        self.assertTrue(torch.allclose(out, torch.full((5, o), 3.0 * hidden)))
+        h = torch.ones(2, hidden)
+        out = _blend(weight, None, h, n, 0, 1, 12.0)
+        self.assertTrue(torch.allclose(out, torch.full((2, o), 1.0 * hidden)))
+
+    def test_span_matches_core_offset_formula(self):
+        n, o, hidden = 4, 2, 5
+        weight = torch.randn(n * o, hidden)
+        bias = torch.randn(n * o)
+        h = torch.randn(3, hidden)
+        start, stop, shift = 0, 3, 12.0
+        out = _blend(weight, bias, h, n, start, stop, shift)
+
+        grid = torch.linspace(1.0, 0.0, n + 1, dtype=torch.float64)
+        dt = (1.0 - shift * grid / (1.0 + (shift - 1.0) * grid)).diff()[start:stop]
+        w = (dt / dt.sum()).to(h.dtype)
+        rows = weight.reshape(n, o, hidden)
+        brows = bias.reshape(n, o)
+        first = max(start, 1)
+        expect_w = rows[0] + torch.einsum("n,noi->oi", w[first - start:], rows[first:stop])
+        expect_b = brows[0] + torch.einsum("n,no->o", w[first - start:], brows[first:stop])
+        self.assertTrue(torch.allclose(out, torch.nn.functional.linear(h, expect_w, expect_b)))
+
+    def test_converted_full_head_reconstructs_that_interval(self):
+        n, o, hidden = 4, 2, 3
+        heads = torch.stack([torch.full((o, hidden), float(i + 1)) for i in range(n)])
+        offsets = _to_offsets(heads.reshape(n * o, hidden), o)
+        h = torch.ones(2, hidden)
+        out = _blend(offsets, None, h, n, 2, 3, 12.0)
+        self.assertTrue(torch.allclose(out, torch.full((2, o), 3.0 * hidden)))
 
     def test_interval_monotonic(self):
         start, stop = interval(torch.tensor(1.0), torch.tensor(0.0), 32, 12.0)
@@ -109,7 +165,8 @@ class BlendTests(unittest.TestCase):
         video, audio = layer(
             torch.ones(4, 3), torch.zeros(1, 3), (0, 2, 0), (2, 4, 1))
         native = inner.video_out(torch.ones(2, 3))
-        pdd = torch.full_like(native, 3.0)
+        start, stop = interval(torch.tensor(1.0), torch.tensor(0.0), 2, 12.0)
+        pdd = _blend(layer.bank.video_w, layer.bank.video_b, torch.ones(2, 3), 2, start, stop, 12.0)
         self.assertTrue(torch.allclose(video, native + 0.5 * (pdd - native)))
         self.assertEqual(audio.shape, (2, 1))
 

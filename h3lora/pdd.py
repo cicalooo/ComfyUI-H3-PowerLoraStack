@@ -6,6 +6,12 @@ onto the native ``[96, hidden]`` head and crashes. Core PR 15908 teaches
 ``FinalLayer`` to blend those rows; this module does the same inside the Power
 LoRA Stack so those files load without a core change.
 
+Core's layout is not a stack of full heads. Row 0 is the full head and every
+later row is an offset from it. A step is ``rows[0] + dt-weighted mean of the
+offsets it spans``. Comfy ``set_weight`` files are already in that layout.
+Original ``proj_out`` / ``audio_proj_out`` banks are full heads, so those are
+converted to offsets before the same blend.
+
 The bank is kept beside the model (object patch + DIFFUSION_MODEL wrapper) and
 is registered as an additional model so ComfyUI can move and account for it.
 The native head is not resized, and PDD strength interpolates from the native
@@ -49,6 +55,14 @@ _AUDIO_BIAS = (
     "final_layer.audio_out.set_bias",
     "audio_proj_out.bias",
 )
+# Original alibaba files store one absolute head per interval. Comfy's
+# set_weight files already use Core's row-0-plus-offsets layout.
+_FULL_HEAD_KEYS = frozenset((
+    "proj_out.weight",
+    "proj_out.bias",
+    "audio_proj_out.weight",
+    "audio_proj_out.bias",
+))
 
 
 def _pop_first(sd, names):
@@ -76,6 +90,17 @@ def _as_bank(tensor, out_features):
         n = t.shape[0] // out_features
         return n, t
     return None
+
+
+def _to_offsets(flat, out_features):
+    """Absolute heads ``[N*O, ...]`` -> row 0 plus offsets from it."""
+    if flat is None or out_features <= 0:
+        return flat
+    rows = flat.reshape(-1, out_features, *flat.shape[1:])
+    if rows.shape[0] <= 1:
+        return flat
+    base = rows[:1]
+    return torch.cat((base, rows[1:] - base), 0).reshape(flat.shape)
 
 
 def peel(sd, video_dim, audio_dim, hidden):
@@ -150,6 +175,16 @@ def peel(sd, video_dim, audio_dim, hidden):
         if audio_b is None:
             notes.append("audio bias dropped")
 
+    # One blend path. set_weight is already offsets; proj_out is not.
+    if vw_key in _FULL_HEAD_KEYS and video_w is not None:
+        video_w = _to_offsets(video_w, video_dim)
+        video_b = _to_offsets(video_b, video_dim)
+        notes.append("video full heads stored as offsets")
+    if aw_key in _FULL_HEAD_KEYS and audio_w is not None:
+        audio_w = _to_offsets(audio_w, audio_dim)
+        audio_b = _to_offsets(audio_b, audio_dim)
+        notes.append("audio full heads stored as offsets")
+
     bank = {
         "n": n,
         "video_dim": video_dim,
@@ -166,15 +201,31 @@ def peel(sd, video_dim, audio_dim, hidden):
 
 
 def _blend(weight, bias, h, n, start, stop, flow_shift):
+    """Core PR 15908 head: row 0 is the full head, later rows are offsets.
+
+    Matches ``comfy.ldm.minimax.model._pdd_head``. Interval 0's dt weight is
+    not applied to an offset; adding row 0 unweighted is that interval's share.
+    """
+    start = max(0, min(n - 1, int(start)))
+    stop = max(start + 1, min(n, int(stop)))
     grid = torch.linspace(1.0, 0.0, n + 1, dtype=torch.float64)
     dt = (1.0 - flow_shift * grid / (1.0 + (flow_shift - 1.0) * grid)).diff()[start:stop]
     w = (dt / dt.sum()).to(device=h.device, dtype=h.dtype)
-    rows = weight.to(device=h.device, dtype=h.dtype).reshape(n, -1, weight.shape[-1])[start:stop]
-    out_w = torch.einsum("n,noi->oi", w, rows)
+    rows = weight.to(device=h.device, dtype=h.dtype).reshape(n, -1, weight.shape[-1])
+    first = max(start, 1)
+    offset_w = w[first - start:]
+    offset_rows = rows[first:stop]
+    if offset_rows.shape[0] == 0:
+        out_w = rows[0]
+    else:
+        out_w = rows[0] + torch.einsum("n,noi->oi", offset_w, offset_rows)
     out_b = None
     if bias is not None:
-        b_rows = bias.to(device=h.device, dtype=h.dtype).reshape(n, -1)[start:stop]
-        out_b = torch.einsum("n,no->o", w, b_rows)
+        brows = bias.to(device=h.device, dtype=h.dtype).reshape(n, -1)
+        if offset_rows.shape[0] == 0:
+            out_b = brows[0]
+        else:
+            out_b = brows[0] + torch.einsum("n,no->o", offset_w, brows[first:stop])
     return F.linear(h, out_w, out_b)
 
 
