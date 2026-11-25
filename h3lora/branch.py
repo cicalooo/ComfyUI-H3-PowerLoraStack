@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import comfy.model_management
+import comfy.ops
 
 from .schedule import Schedule, ScheduleState, progress_from
 
@@ -22,6 +23,7 @@ from .schedule import Schedule, ScheduleState, progress_from
 # Above this, apply the branch in token slices so that add does not OOM a 24 GB card.
 _WHOLE_RESIDUAL_MAX_BYTES = 256 << 20
 _RESIDUAL_SLICE_BYTES = 64 << 20
+_FC2_SLICE_ROWS = 768
 
 
 @dataclass
@@ -141,6 +143,34 @@ class LoraBranch:
         return out
 
 
+class SlicedFC2Branch:
+    """Run the native H3 MLP and apply its fc2 LoRAs after the fused linear."""
+
+    def __init__(self, mlp, branches):
+        self.mlp = mlp
+        self.branches = branches
+
+    def _apply_slice(self, raw, out):
+        gate, up = raw.chunk(2, dim=-1)
+        activated = F.silu(gate).mul_(up)
+        for branch in self.branches:
+            out = branch._residual_whole(activated, out)
+        return out
+
+    def __call__(self, x):
+        raw = self.mlp.fc1(x)
+        out = comfy.ops.linear_input_act(self.mlp.fc2, raw, "swiglu")
+        # H3 packs its tokens along dim 0. Materialize SwiGLU only for the
+        # current adapter slice, after the base linear's workspace is released.
+        grad_slices = [] if out.requires_grad else None
+        for start in range(0, raw.shape[0], _FC2_SLICE_ROWS):
+            stop = start + _FC2_SLICE_ROWS
+            result = self._apply_slice(raw[start:stop], out[start:stop])
+            if grad_slices is not None:
+                grad_slices.append(result)
+        return torch.cat(grad_slices, dim=0) if grad_slices else out
+
+
 def fuse(contributions, compute_dtype):
     """Fuse contributions, retaining rank boundaries only when scheduled."""
     if all(len(item) == 3 for item in contributions):
@@ -241,8 +271,26 @@ def attach(model_patcher, per_module, compute_dtype, tag: str):
     for module_path in pairs:
         forward_key = f"{module_path}.forward"
         original = model_patcher.get_model_object(forward_key)
-        model_patcher.add_object_patch(
-            forward_key, LoraBranch(bank_patcher, state, module_path, original))
+        branch = LoraBranch(bank_patcher, state, module_path, original)
+        if module_path.endswith(".mlp.fc2"):
+            weight = model_patcher.get_model_object(module_path).weight
+            if (getattr(weight, "_layout_cls", None) == "AsymW4A8Int8Layout"
+                    and hasattr(comfy.ops, "linear_input_act")):
+                from comfy.ldm.minimax.model import MLP
+
+                mlp_path = module_path.rsplit(".", 1)[0]
+                mlp_forward_key = f"{mlp_path}.forward"
+                mlp_forward = model_patcher.get_model_object(mlp_forward_key)
+                if isinstance(mlp_forward, SlicedFC2Branch):
+                    model_patcher.add_object_patch(
+                        mlp_forward_key,
+                        SlicedFC2Branch(mlp_forward.mlp, (*mlp_forward.branches, branch)))
+                    continue
+                if getattr(mlp_forward, "__func__", None) is MLP.forward:
+                    mlp = model_patcher.get_model_object(mlp_path)
+                    model_patcher.add_object_patch(mlp_forward_key, SlicedFC2Branch(mlp, (branch,)))
+                    continue
+        model_patcher.add_object_patch(forward_key, branch)
     controller = ScheduleController(state, bank.scheduled, compute_dtype) if bank.scheduled else None
     return len(pairs), controller
 

@@ -1,7 +1,14 @@
 from collections import OrderedDict
 import unittest
+from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
+
+from comfy import ops
+from comfy.ldm.minimax.model import MLP
+from comfy.model_patcher import ModelPatcher
+from comfy.quant_ops import QuantizedTensor
 
 import h3lora.branch as branch_mod
 from h3lora.branch import FusedBranch, LoraBank, LoraBranch, ScheduleController, fuse
@@ -92,6 +99,59 @@ class BranchScheduleTests(unittest.TestCase):
             branch_mod._RESIDUAL_SLICE_BYTES = old_slice
         expected = (1.0 + bias).expand(seq, out)
         self.assertTrue(torch.allclose(got, expected))
+
+
+    def test_grouped_fc2_branch_uses_fused_base_and_keeps_stacked_adapters(self):
+        # More than one slice, plus a tail. Start with a real H3 MLP whose
+        # quantized fc2 goes through linear_input_act.
+        device = torch.device("cpu")
+        dtype = torch.float32
+        dtype_ops = ops.mixed_precision_ops(compute_dtype=dtype)
+        mlp = MLP(64, 256, dtype=dtype, device=device, operations=dtype_ops)
+        mlp.fc1 = torch.nn.Linear(64, 512, bias=False)
+        layer = torch.nn.Module()
+        layer.block = torch.nn.Module()
+        layer.block.mlp = mlp
+        packed = QuantizedTensor.from_float(
+            torch.randn(64, 256), "AsymW4A8Int8Layout", bits=4, scale_search=False)
+        mlp.fc2.weight = torch.nn.Parameter(packed, requires_grad=False)
+        mlp.fc2.layout_type = "AsymW4A8Int8Layout"
+        mlp.fc2.quant_format = "asym_w4a8_int8"
+        codes = packed.state_dict()[""].clone()
+        x = torch.randn(15, 64)
+        a, b = torch.randn(2, 256), torch.randn(64, 2)
+        c, d = torch.randn(3, 256), torch.randn(64, 3)
+        with torch.inference_mode():
+            baseline = mlp(x)
+            gate, up = mlp.fc1(x).chunk(2, dim=-1)
+            activated = F.silu(gate).mul_(up)
+            expected = baseline + F.linear(F.linear(activated, a), b)
+            expected += F.linear(F.linear(activated, c), d) * 0.5
+            first = ModelPatcher(layer, device, device)
+            with patch.object(branch_mod.comfy.model_management, "get_torch_device",
+                              return_value=device):
+                branch_mod.attach(first, {"block.mlp.fc2": [(b, a, 1.0)]}, dtype, "first")
+                second = first.clone()
+                _, controller = branch_mod.attach(second, {"block.mlp.fc2": [
+                    (d, c, 1.0, Schedule(start_strength=0.5, end_strength=0.5), None),
+                ]}, dtype, "second")
+            self.assertNotIn("block.mlp.fc2.forward", second.object_patches)
+            self.assertNotIn("block.mlp.fc2.comfy_force_forward", second.object_patches)
+            self.assertEqual(len(first.object_patches["block.mlp.forward"].branches), 1)
+            self.assertEqual(len(second.object_patches["block.mlp.forward"].branches), 2)
+            second.patch_model(load_weights=False)
+            try:
+                with patch.object(branch_mod, "_FC2_SLICE_ROWS", 7), patch.object(
+                        ops, "linear_input_act", wraps=ops.linear_input_act) as base_call:
+                    result = controller(lambda *_args, **_kwargs: mlp(x), None,
+                                        torch.tensor([0.5]))
+                    base_call.assert_called_once()
+                    self.assertEqual(base_call.call_args.args[2], "swiglu")
+                torch.testing.assert_close(result, expected, atol=2e-5, rtol=2e-5)
+                self.assertTrue(torch.equal(mlp.fc2.weight.state_dict()[""], codes))
+            finally:
+                second.unpatch_model(unpatch_weights=False)
+            torch.testing.assert_close(mlp(x), baseline, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
