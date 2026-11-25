@@ -27,6 +27,7 @@ sidecar_mod.ensure_load_hook()
 
 # Layers whose forward is bypassed by a fused kernel, per weight layout.  A
 # runtime branch on these would be silently dropped, so they must merge.
+# Grouped W3A8-W6A8 use branch.SlicedFC2Branch at the MLP boundary.
 _FORWARD_BYPASSED = {"TensorWiseINT8Layout": ("mlp.fc2",)}
 
 

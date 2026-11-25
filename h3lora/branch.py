@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import logging
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,8 @@ import comfy.model_management
 import comfy.ops
 
 from .schedule import Schedule, ScheduleState, progress_from
+
+LOG = logging.getLogger("h3.powerlorastack")
 
 # A full-sequence LoRA residual is a second activation the size of fc1/qkv.
 # Above this, apply the branch in token slices so that add does not OOM a 24 GB card.
@@ -158,6 +161,8 @@ class SlicedFC2Branch:
         return out
 
     def __call__(self, x):
+        # Mirrors native H3 MLP.forward(x) in ComfyUI da8bd08. Recheck this
+        # wrapper when upstream changes the signature or residual handling.
         raw = self.mlp.fc1(x)
         out = comfy.ops.linear_input_act(self.mlp.fc2, raw, "swiglu")
         # H3 packs its tokens along dim 0. Materialize SwiGLU only for the
@@ -290,6 +295,11 @@ def attach(model_patcher, per_module, compute_dtype, tag: str):
                     mlp = model_patcher.get_model_object(mlp_path)
                     model_patcher.add_object_patch(mlp_forward_key, SlicedFC2Branch(mlp, (branch,)))
                     continue
+                LOG.warning(
+                    "H3 Power LoRA Stack: %s has an unrecognized MLP.forward. "
+                    "The quantized linear may bypass its LoRA branch.",
+                    module_path,
+                )
         model_patcher.add_object_patch(forward_key, branch)
     controller = ScheduleController(state, bank.scheduled, compute_dtype) if bank.scheduled else None
     return len(pairs), controller

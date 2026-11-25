@@ -153,6 +153,24 @@ class BranchScheduleTests(unittest.TestCase):
                 second.unpatch_model(unpatch_weights=False)
             torch.testing.assert_close(mlp(x), baseline, atol=0, rtol=0)
 
+            # A custom forward can still call the fused path and skip fc2.forward.
+            native_forward = mlp.forward
+            with patch.object(mlp, "forward", lambda value: native_forward(value)):
+                fallback = ModelPatcher(layer, device, device)
+                with patch.object(branch_mod.comfy.model_management, "get_torch_device",
+                                  return_value=device):
+                    with self.assertLogs("h3.powerlorastack", level="WARNING") as logs:
+                        branch_mod.attach(fallback, {"block.mlp.fc2": [(b, a, 1.0)]},
+                                          dtype, "fallback")
+                self.assertIn("block.mlp.fc2", logs.output[0])
+                self.assertIn("may bypass its LoRA branch", logs.output[0])
+                self.assertIn("block.mlp.fc2.forward", fallback.object_patches)
+                fallback.patch_model(load_weights=False)
+                try:
+                    torch.testing.assert_close(mlp(x), baseline, atol=0, rtol=0)
+                finally:
+                    fallback.unpatch_model(unpatch_weights=False)
+
 
 if __name__ == "__main__":
     unittest.main()
