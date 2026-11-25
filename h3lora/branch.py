@@ -23,7 +23,7 @@ from .schedule import Schedule, ScheduleState, progress_from
 # Above this, apply the branch in token slices so that add does not OOM a 24 GB card.
 _WHOLE_RESIDUAL_MAX_BYTES = 256 << 20
 _RESIDUAL_SLICE_BYTES = 64 << 20
-_FC2_SLICE_ROWS = 768
+_FC2_SLICE_ROWS = 512
 
 
 @dataclass
