@@ -243,6 +243,10 @@ def attach(model_patcher, per_module, compute_dtype, tag: str):
         original = model_patcher.get_model_object(forward_key)
         model_patcher.add_object_patch(
             forward_key, LoraBranch(bank_patcher, state, module_path, original))
+        if module_path.endswith(".mlp.fc2"):
+            weight = model_patcher.get_model_object(module_path).weight
+            if getattr(weight, "_layout_cls", None) == "AsymW4A8Int8Layout":
+                model_patcher.add_object_patch(f"{module_path}.comfy_force_forward", True)
     controller = ScheduleController(state, bank.scheduled, compute_dtype) if bank.scheduled else None
     return len(pairs), controller
 
