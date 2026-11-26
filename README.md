@@ -58,9 +58,16 @@ rank 64).
   branch are reported as rejected
 - `merge` — stock behaviour; only useful for comparison
 
-`mlp.fc2` under `TensorWiseINT8Layout` is reached through
-`comfy.ops.linear_input_act`, which never calls `fc2.forward`. A branch there
-would be dropped, so those layers merge even in `branch` mode.
+H3 calls `comfy.ops.linear_input_act` for `mlp.fc2`. With
+`TensorWiseINT8Layout`, `auto` still merges these LoRAs and explicit
+`branch` mode rejects them.
+
+Grouped W3A8, W4A8, W5A8, and W6A8 share `AsymW4A8Int8Layout`. Their
+`fc2` LoRAs branch at the native H3 `MLP.forward(x)` boundary. The base
+linear stays fused and the LoRA is applied in 512-token activation slices.
+For a custom or incompatible `MLP.forward`, the stack retains the
+`fc2.forward` hook for callers that reach it. The node's report names any
+such layer because the fused path may bypass the hook.
 
 </details>
 

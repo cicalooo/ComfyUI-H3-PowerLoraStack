@@ -143,9 +143,12 @@ class H3PowerLoraStack:
                 "model": ("MODEL",),
                 "quantized_layers": (["auto", "branch", "merge"], {
                     "default": "auto",
-                    "tooltip": "auto: runtime branch for quantized layers, merge for the rest. "
-                               "branch: never modify a weight. merge: stock behaviour "
-                               "(destroys LoRAs on w4a8/int4).",
+                    "tooltip": "auto: branch quantized layers where supported, merge the rest. "
+                               "branch: never modify a weight. merge: stock behaviour. "
+                               "H3 fc2: W3A8-W6A8 branch at MLP.forward. "
+                               "TensorWiseINT8Layout merges in auto and is rejected in branch mode. "
+                               "The report warns if a custom or incompatible MLP.forward "
+                               "may bypass the grouped fc2 LoRA.",
                 }),
                 "adaln_port": (["auto", "strip", "off"], {
                     "default": "auto",

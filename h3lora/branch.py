@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import inspect
 import logging
 
 import torch
@@ -253,8 +254,22 @@ class ScheduleController:
             self.state.clear()
 
 
-def attach(model_patcher, per_module, compute_dtype, tag: str):
-    """Build the bank, register it for VRAM accounting, and patch forwards."""
+def _supports_sliced_fc2(forward, native_forward):
+    if getattr(forward, "__func__", None) is not native_forward:
+        return False
+    try:
+        params = inspect.signature(native_forward).parameters
+    except (TypeError, ValueError):
+        return False
+    return tuple(params) == ("self", "x") and all(
+        param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+        and param.default is inspect.Parameter.empty
+        for param in params.values()
+    )
+
+
+def attach(model_patcher, per_module, compute_dtype, tag: str, notes=None):
+    """Build the bank and patch forwards. Collect fallback warnings in notes."""
     if not per_module:
         return 0, None
 
@@ -291,15 +306,17 @@ def attach(model_patcher, per_module, compute_dtype, tag: str):
                         mlp_forward_key,
                         SlicedFC2Branch(mlp_forward.mlp, (*mlp_forward.branches, branch)))
                     continue
-                if getattr(mlp_forward, "__func__", None) is MLP.forward:
+                if _supports_sliced_fc2(mlp_forward, MLP.forward):
                     mlp = model_patcher.get_model_object(mlp_path)
                     model_patcher.add_object_patch(mlp_forward_key, SlicedFC2Branch(mlp, (branch,)))
                     continue
-                LOG.warning(
-                    "H3 Power LoRA Stack: %s has an unrecognized MLP.forward. "
-                    "The quantized linear may bypass its LoRA branch.",
-                    module_path,
+                message = (
+                    f"{module_path} has an unrecognized MLP.forward. "
+                    "The quantized linear may bypass its LoRA branch."
                 )
+                LOG.warning("H3 Power LoRA Stack: %s", message)
+                if notes is not None:
+                    notes.append(message)
         model_patcher.add_object_patch(forward_key, branch)
     controller = ScheduleController(state, bank.scheduled, compute_dtype) if bank.scheduled else None
     return len(pairs), controller

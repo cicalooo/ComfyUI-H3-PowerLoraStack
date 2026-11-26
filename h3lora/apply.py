@@ -414,7 +414,9 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
         while patcher.get_additional_models_with_key(f"h3_power_lora_bank_{n}"):
             n += 1
         tag = f"h3_power_lora_bank_{n}"
-        _count, controller = branch_mod.attach(patcher, per_module, compute_dtype, tag)
+        branch_notes: list[str] = []
+        _count, controller = branch_mod.attach(
+            patcher, per_module, compute_dtype, tag, notes=branch_notes)
         if controller is not None:
             patcher.add_wrapper_with_key(
                 comfy.patcher_extension.WrappersMP.APPLY_MODEL,
@@ -423,6 +425,8 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
             )
         report.add(f"branch bank: {len(per_module)} layers, "
                    f"{report.bank_bytes / (1024 ** 2):.0f} MB")
+        for note in branch_notes:
+            report.add(f"  ! {note} (counted as branched because a hook was registered)")
 
     if pdd_entry is not None:
         pdd_bank = pdd_entry["bank"]
