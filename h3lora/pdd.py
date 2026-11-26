@@ -199,16 +199,23 @@ def peel(sd, video_dim, audio_dim, hidden):
     return bank, note
 
 
-def _blend(weight, bias, h, n, start, stop, flow_shift):
+def _blend(weight, bias, h, n, start, stop, flow_shift=None, grid=None):
     """Row 0 is the full head, later rows are offsets.
 
     Interval 0's dt weight is not applied to an offset; adding row 0 unweighted
-    is that interval's share.
+    is that interval's share.  ``grid`` is the decreasing sigma grid supplied by
+    current ComfyUI; ``flow_shift`` is the older signature used as a fallback.
     """
     start = max(0, min(n - 1, int(start)))
     stop = max(start + 1, min(n, int(stop)))
-    grid = torch.linspace(1.0, 0.0, n + 1, dtype=torch.float64)
-    dt = (1.0 - flow_shift * grid / (1.0 + (flow_shift - 1.0) * grid)).diff()[start:stop]
+    if grid is None:
+        base = torch.linspace(1.0, 0.0, n + 1, dtype=torch.float64)
+        dt = (1.0 - flow_shift * base / (1.0 + (flow_shift - 1.0) * base)).diff()[start:stop]
+    else:
+        g = torch.as_tensor(grid, dtype=torch.float64).flatten()
+        if g.numel() < n + 1:
+            raise ValueError(f"PDD grid has {g.numel()} points, expected {n + 1}")
+        dt = (g[start:stop] - g[start + 1:stop + 1]).to(torch.float64)
     w = (dt / dt.sum()).to(device=h.device, dtype=h.dtype)
     rows = weight.to(device=h.device, dtype=h.dtype).reshape(n, -1, weight.shape[-1])
     first = max(start, 1)
@@ -236,6 +243,31 @@ def interval(sigma, sigma_next, n, video_shift):
     return start, stop
 
 
+def _sigma_grid(n, flow_shift):
+    """Decreasing sigma grid for a legacy ``shifts`` fallback."""
+    return [time_shift_sigma(k / n, 1.0, flow_shift) for k in range(n, -1, -1)]
+
+
+def _is_legacy_shifts(value) -> bool:
+    return (isinstance(value, (tuple, list)) and len(value) == 2
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for v in value))
+
+
+def _scalar(value) -> float:
+    return float(torch.as_tensor(value).flatten()[0])
+
+
+def grid_interval(sigma, sigma_next, n, grid):
+    """Match current ComfyUI's nearest-point selection on a sigma grid."""
+    g = torch.as_tensor(grid, dtype=torch.float64).flatten()
+    if g.numel() < n + 1:
+        raise ValueError(f"PDD grid has {g.numel()} points, expected {n + 1}")
+    start, stop = (min(range(n + 1), key=lambda k: abs(float(g[k]) - _scalar(s)))
+                   for s in (sigma, sigma_next))
+    return min(start, n - 1), max(stop, start + 1)
+
+
 class PddFinalLayer(nn.Module):
     def __init__(self, inner, bank, ctx):
         super().__init__()
@@ -251,27 +283,44 @@ class PddFinalLayer(nn.Module):
         self.video_out = inner.video_out
         self.audio_out = inner.audio_out
 
-    def forward(self, x, t_emb, video_seg, audio_seg,
-                sigma=None, sample_sigmas=None, shifts=None):
-        """Run PDD under both current and legacy MiniMax H3 final-layer ABIs.
+    @property
+    def pdd_steps(self):
+        return int(self.bank.n)
 
-        Current ComfyUI passes sigma, the sampler schedule, and stream shifts
-        directly. Older cores expose only the first four arguments, so retain
-        the outer wrapper's thread-local values as a compatibility fallback.
+    def forward(self, x, t_emb, video_seg, audio_seg,
+                sigma=None, sample_sigmas=None, grids=None, shifts=None):
+        """Run PDD under the current and legacy MiniMax H3 final-layer ABIs.
+
+        Current ComfyUI passes sigma, the sampler schedule, and one decreasing
+        sigma grid per stream. Older cores pass shifts instead, and the oldest
+        expose only the first four arguments; retain the outer wrapper's
+        thread-local values as a compatibility fallback.
         """
         inner = self.inner
         bank = self.bank
         ctx = self.ctx
         n = bank.n
 
+        if grids is not None and _is_legacy_shifts(grids):
+            shifts, grids = grids, None
+        if grids is None:
+            if shifts is None:
+                shifts = ctx.get("shifts")
+            if shifts is None:
+                shifts = (12.0, 3.0)
+            grids = (_sigma_grid(n, float(shifts[0])),
+                     _sigma_grid(n, float(shifts[1])))
+        else:
+            grids = tuple(grids)
+            if not grids:
+                raise ValueError("MiniMax H3 PDD heads need a non-empty sigma grid")
+            if len(grids) == 1:
+                grids = (grids[0], grids[0])
+
         if sigma is None:
             sigma = ctx.get("sigma")
         if sample_sigmas is None:
             sample_sigmas = ctx.get("sample_sigmas")
-        if shifts is None:
-            shifts = ctx.get("shifts")
-        if shifts is None:
-            shifts = (12.0, 3.0)
         if sample_sigmas is None or sigma is None:
             raise ValueError("MiniMax H3 PDD heads need the sampler's sigma schedule")
 
@@ -295,20 +344,22 @@ class PddFinalLayer(nn.Module):
         if strength is None:
             strength = ctx.default_strength
         strength = float(strength)
-        start, stop = interval(sigma, sigma_next, n, shifts[0])
+        start, stop = grid_interval(sigma, sigma_next, n, grids[0])
         vh = mod(video_seg)
         ah = mod(audio_seg)
         native_video = inner.video_out(vh)
         if bank.video_w is None:
             video = native_video
         else:
-            pdd_video = _blend(bank.video_w, bank.video_b, vh, n, start, stop, shifts[0])
+            pdd_video = _blend(bank.video_w, bank.video_b, vh, n, start, stop,
+                               grid=grids[0])
             video = native_video + strength * (pdd_video - native_video)
         native_audio = inner.audio_out(ah)
         if bank.audio_w is None:
             audio = native_audio
         else:
-            pdd_audio = _blend(bank.audio_w, bank.audio_b, ah, n, start, stop, shifts[1])
+            pdd_audio = _blend(bank.audio_w, bank.audio_b, ah, n, start, stop,
+                               grid=grids[1])
             audio = native_audio + strength * (pdd_audio - native_audio)
         return video, audio
 
@@ -383,7 +434,7 @@ def attach(patcher, bank, strength=1.0, schedule=None):
             if "sample_sigmas" not in schedule_options and sample_sigmas is not None:
                 schedule_options = dict(transformer_options)
                 schedule_options["sample_sigmas"] = sample_sigmas
-            progress = progress_from(timestep, schedule_options, ctx.schedule.domain)
+            progress = progress_from(sigma, schedule_options, ctx.schedule.domain)
             effective_strength *= ctx.schedule.evaluate(progress)
         ctx.set(sigma, sample_sigmas, (
             float(transformer_options.get("minimax_h3_sigma_shift_video", 12.0)),

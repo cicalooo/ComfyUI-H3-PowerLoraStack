@@ -77,6 +77,8 @@ def register():
             body = await request.json()
         except Exception:
             return web.json_response({"error": "bad request"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "expected a JSON object"}, status=400)
         names = body.get("loras")
         if not isinstance(names, list):
             return web.json_response({"error": "expected {'loras': [...]}"}, status=400)

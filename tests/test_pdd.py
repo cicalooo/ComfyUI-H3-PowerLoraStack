@@ -1,10 +1,14 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 
-from h3lora.pdd import PddBank, PddFinalLayer, PddState, _as_bank, _blend, _to_offsets, interval, peel
+import h3lora.pdd as pdd_mod
+from h3lora.pdd import (PddBank, PddFinalLayer, PddState, _as_bank, _blend,
+                        _sigma_grid, _to_offsets, grid_interval, interval, peel)
+from h3lora.schedule import Schedule
 
 
 class PeelTests(unittest.TestCase):
@@ -170,7 +174,7 @@ class BlendTests(unittest.TestCase):
         self.assertTrue(torch.allclose(video, native + 0.5 * (pdd - native)))
         self.assertEqual(audio.shape, (2, 1))
 
-    def test_current_comfy_signature_prefers_direct_schedule_arguments(self):
+    def test_current_comfy_signature_uses_direct_grids(self):
         class StaticAdaln(nn.Module):
             def forward(self, _t):
                 return torch.zeros(2, 3), torch.zeros(2, 3)
@@ -196,9 +200,10 @@ class BlendTests(unittest.TestCase):
         state.set(torch.tensor(0.5), torch.empty(0), (1.0, 1.0), 1.0)
         layer = PddFinalLayer(inner, PddBank(bank), state)
 
+        self.assertEqual(layer.pdd_steps, 4)
         sigma = torch.tensor(1.0)
         sample_sigmas = torch.tensor([1.0, 0.0])
-        shifts = (12.0, 3.0)
+        grids = (_sigma_grid(4, 12.0), _sigma_grid(4, 3.0))
         x = torch.ones(4, 3)
         video, audio = layer(
             x,
@@ -207,10 +212,10 @@ class BlendTests(unittest.TestCase):
             (2, 4, 1),
             sigma,
             sample_sigmas,
-            shifts,
+            grids,
         )
 
-        start, stop = interval(sigma, sample_sigmas[1], 4, shifts[0])
+        start, stop = grid_interval(sigma, sample_sigmas[1], 4, grids[0])
         expected_video = _blend(
             layer.bank.video_w,
             layer.bank.video_b,
@@ -218,10 +223,102 @@ class BlendTests(unittest.TestCase):
             4,
             start,
             stop,
-            shifts[0],
+            grid=grids[0],
         )
         self.assertTrue(torch.allclose(video, expected_video))
         self.assertEqual(audio.shape, (2, 1))
+
+    def test_legacy_shift_signature_still_works(self):
+        class StaticAdaln(nn.Module):
+            def forward(self, _t):
+                return torch.zeros(2, 3), torch.zeros(2, 3)
+
+        inner = SimpleNamespace(
+            norm=nn.Identity(),
+            adaln_proj=StaticAdaln(),
+            video_out=nn.Linear(3, 2),
+            audio_out=nn.Linear(3, 1),
+        )
+        bank, _ = peel({
+            "final_layer.video_out.set_weight": torch.ones(2 * 2, 3),
+        }, 2, 1, 3)
+        layer = PddFinalLayer(inner, PddBank(bank), PddState(1.0, None))
+        sigma = torch.tensor(1.0)
+        sample_sigmas = torch.tensor([1.0, 0.0])
+        shifts = (12.0, 3.0)
+        x = torch.ones(4, 3)
+        video, _audio = layer(
+            x, torch.zeros(1, 3), (0, 2, 0), (2, 4, 1),
+            sigma, sample_sigmas, shifts,
+        )
+        start, stop = interval(sigma, sample_sigmas[1], 2, shifts[0])
+        expected = _blend(layer.bank.video_w, layer.bank.video_b, x[:2], 2,
+                          start, stop, grid=_sigma_grid(2, shifts[0]))
+        self.assertTrue(torch.allclose(video, expected))
+
+
+class AttachTests(unittest.TestCase):
+    def test_pdd_schedule_progress_uses_sigma_not_timestep(self):
+        class StaticAdaln(nn.Module):
+            def forward(self, _t):
+                return torch.zeros(2, 3), torch.zeros(2, 3)
+
+        inner = SimpleNamespace(
+            norm=nn.Identity(),
+            adaln_proj=StaticAdaln(),
+            video_out=nn.Linear(3, 2),
+            audio_out=nn.Linear(3, 1),
+        )
+        bank, _ = peel({
+            "final_layer.video_out.set_weight": torch.ones(2 * 2, 3),
+        }, 2, 1, 3)
+
+        class FakePatcher:
+            def __init__(self):
+                self.layer = None
+                self.additional = {}
+                self.object_patches = {}
+                self.wrappers = []
+
+            def get_model_object(self, name):
+                if name == "diffusion_model.final_layer":
+                    return inner
+                raise AttributeError(name)
+
+            def get_additional_models_with_key(self, key):
+                return self.additional.get(key)
+
+            def set_additional_models(self, key, models):
+                self.additional[key] = models
+
+            def add_object_patch(self, key, obj):
+                self.object_patches[key] = obj
+                self.layer = obj
+
+            def get_wrappers(self, *_args):
+                return []
+
+            def add_wrapper_with_key(self, _type, _key, wrapper):
+                self.wrappers.append(wrapper)
+
+        patcher = FakePatcher()
+        device = torch.device("cpu")
+        schedule = Schedule(start_strength=0.0, end_strength=1.0, domain="steps")
+        with patch.object(pdd_mod.comfy.model_management, "get_torch_device",
+                          return_value=device), patch.object(
+                pdd_mod.comfy.model_management, "unet_offload_device",
+                return_value=device):
+            pdd_mod.attach(patcher, bank, 1.0, schedule)
+
+        captured = {}
+
+        def executor(*_args, **_kwargs):
+            captured["strength"] = patcher.layer.ctx.get("strength")
+            return torch.zeros(1)
+
+        options = {"sample_sigmas": torch.tensor([1.0, 0.5, 0.0])}
+        patcher.wrappers[0](executor, None, torch.tensor([500.0]), None, options)
+        self.assertAlmostEqual(captured["strength"], 1.0, places=6)
 
 
 if __name__ == "__main__":
