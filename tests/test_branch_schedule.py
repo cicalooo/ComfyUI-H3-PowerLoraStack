@@ -1,9 +1,17 @@
 from collections import OrderedDict
 import unittest
+from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
+
+from comfy import ops, utils
+from comfy.ldm.minimax.model import MLP
+from comfy.model_patcher import ModelPatcher
+from comfy.quant_ops import QuantizedTensor
 
 import h3lora.branch as branch_mod
+from h3lora.apply import apply_stack
 from h3lora.branch import FusedBranch, LoraBank, LoraBranch, ScheduleController, fuse
 from h3lora.schedule import Schedule, ScheduleState
 
@@ -92,6 +100,118 @@ class BranchScheduleTests(unittest.TestCase):
             branch_mod._RESIDUAL_SLICE_BYTES = old_slice
         expected = (1.0 + bias).expand(seq, out)
         self.assertTrue(torch.allclose(got, expected))
+
+
+    def _grouped_fc2_model(self, bits):
+        device = torch.device("cpu")
+        dtype = torch.float32
+        dtype_ops = ops.mixed_precision_ops(compute_dtype=dtype)
+        mlp = MLP(64, 256, dtype=dtype, device=device, operations=dtype_ops)
+        mlp.fc1 = torch.nn.Linear(64, 512, bias=False)
+        layer = torch.nn.Module()
+        layer.diffusion_model = torch.nn.Module()
+        layer.diffusion_model.block = torch.nn.Module()
+        layer.diffusion_model.block.mlp = mlp
+        layer.diffusion_model.final_layer = torch.nn.Module()
+        layer.diffusion_model.final_layer.video_out = torch.nn.Identity()
+        layer.diffusion_model.final_layer.audio_out = torch.nn.Identity()
+        layer.get_dtype = lambda: dtype
+        packed = QuantizedTensor.from_float(
+            torch.randn(64, 256), "AsymW4A8Int8Layout", bits=bits, scale_search=False)
+        mlp.fc2.weight = torch.nn.Parameter(packed, requires_grad=False)
+        mlp.fc2.layout_type = "AsymW4A8Int8Layout"
+        mlp.fc2.quant_format = "asym_w4a8_int8" if bits == 4 else f"w{bits}a8_int8"
+        return mlp, ModelPatcher(layer, device, device)
+
+    def test_grouped_fc2_branch_uses_fused_base_and_keeps_stacked_adapters(self):
+        for bits in (3, 4, 5, 6):
+            with self.subTest(bits=bits):
+                self._assert_grouped_fc2_branch(bits)
+
+    def _assert_grouped_fc2_branch(self, bits):
+        # More than one slice, plus a tail. Use the real H3 fused dispatch.
+        mlp, first = self._grouped_fc2_model(bits)
+        module_path = "diffusion_model.block.mlp.fc2"
+        mlp_forward_key = "diffusion_model.block.mlp.forward"
+        codes = mlp.fc2.weight.state_dict()[""].clone()
+        x = torch.randn(15, 64)
+        a, b = torch.randn(2, 256), torch.randn(64, 2)
+        c, d = torch.randn(3, 256), torch.randn(64, 3)
+        with torch.inference_mode():
+            baseline = mlp(x)
+            gate, up = mlp.fc1(x).chunk(2, dim=-1)
+            activated = F.silu(gate).mul_(up)
+            expected = baseline + F.linear(F.linear(activated, a), b)
+            expected += F.linear(F.linear(activated, c), d) * 0.5
+            notes = []
+            with patch.object(branch_mod.comfy.model_management, "get_torch_device",
+                              return_value=first.load_device):
+                branch_mod.attach(first, {module_path: [(b, a, 1.0)]}, first.model_dtype(),
+                                  "first", notes=notes)
+                second = first.clone()
+                _, controller = branch_mod.attach(second, {module_path: [
+                    (d, c, 1.0, Schedule(start_strength=0.5, end_strength=0.5), None),
+                ]}, first.model_dtype(), "second", notes=notes)
+            self.assertEqual(notes, [])
+            self.assertNotIn(f"{module_path}.forward", second.object_patches)
+            self.assertNotIn(f"{module_path}.comfy_force_forward", second.object_patches)
+            self.assertEqual(len(first.object_patches[mlp_forward_key].branches), 1)
+            self.assertEqual(len(second.object_patches[mlp_forward_key].branches), 2)
+            second.patch_model(load_weights=False)
+            try:
+                with patch.object(branch_mod, "_FC2_SLICE_ROWS", 7), patch.object(
+                        ops, "linear_input_act", wraps=ops.linear_input_act) as base_call:
+                    result = controller(lambda *_args, **_kwargs: mlp(x), None,
+                                        torch.tensor([0.5]))
+                    base_call.assert_called_once()
+                    self.assertEqual(base_call.call_args.args[2], "swiglu")
+                torch.testing.assert_close(result, expected, atol=2e-5, rtol=2e-5)
+                self.assertTrue(torch.equal(mlp.fc2.weight.state_dict()[""], codes))
+            finally:
+                second.unpatch_model(unpatch_weights=False)
+            torch.testing.assert_close(mlp(x), baseline, atol=0, rtol=0)
+
+    def test_grouped_fc2_fallback_warns_in_report_and_leaves_mlp_arguments_intact(self):
+        mlp, patcher = self._grouped_fc2_model(4)
+        x = torch.randn(15, 64)
+        residual = torch.ones_like(x)
+        module_path = "diffusion_model.block.mlp.fc2"
+        lora = {
+            f"{module_path}.lora_A.weight": torch.randn(2, 256),
+            f"{module_path}.lora_B.weight": torch.randn(64, 2),
+        }
+        native_forward = MLP.forward
+
+        def future_forward(self, x, residual=None, gate=None, segments=None):
+            out = native_forward(self, x)
+            return out if residual is None else out + residual
+
+        forwards = (
+            ("custom", patch.object(mlp, "forward", lambda x: native_forward(mlp, x)), {}),
+            ("future", patch.object(MLP, "forward", future_forward), {"residual": residual}),
+        )
+        with torch.inference_mode():
+            for name, override, kwargs in forwards:
+                with self.subTest(forward=name), override:
+                    baseline = mlp(x, **kwargs)
+                    with patch.object(utils, "load_torch_file", return_value=lora), patch.object(
+                            branch_mod.comfy.model_management, "get_torch_device",
+                            return_value=patcher.load_device), self.assertLogs(
+                            "h3.powerlorastack", level="WARNING") as logs:
+                        result, report = apply_stack(patcher, [{"path": "synthetic"}],
+                                                     adaln_mode="off")
+                    warning = (f"{module_path} has an unrecognized MLP.forward. "
+                               "The quantized linear may bypass its LoRA branch.")
+                    self.assertIn(warning, logs.output[0])
+                    self.assertIn(warning, report.text())
+                    self.assertIn("counted as branched because a hook was registered", report.text())
+                    self.assertIn(f"{module_path}.forward", result.object_patches)
+                    self.assertNotIn("diffusion_model.block.mlp.forward", result.object_patches)
+                    result.patch_model(load_weights=False)
+                    try:
+                        torch.testing.assert_close(mlp(x, **kwargs), baseline, atol=0, rtol=0)
+                    finally:
+                        result.unpatch_model(unpatch_weights=False)
 
 
 if __name__ == "__main__":

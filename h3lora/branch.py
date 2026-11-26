@@ -9,19 +9,25 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import inspect
+import logging
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import comfy.model_management
+import comfy.ops
 
 from .schedule import Schedule, ScheduleState, progress_from
+
+LOG = logging.getLogger("h3.powerlorastack")
 
 # A full-sequence LoRA residual is a second activation the size of fc1/qkv.
 # Above this, apply the branch in token slices so that add does not OOM a 24 GB card.
 _WHOLE_RESIDUAL_MAX_BYTES = 256 << 20
 _RESIDUAL_SLICE_BYTES = 64 << 20
+_FC2_SLICE_ROWS = 512
 
 
 @dataclass
@@ -141,6 +147,36 @@ class LoraBranch:
         return out
 
 
+class SlicedFC2Branch:
+    """Run the native H3 MLP and apply its fc2 LoRAs after the fused linear."""
+
+    def __init__(self, mlp, branches):
+        self.mlp = mlp
+        self.branches = branches
+
+    def _apply_slice(self, raw, out):
+        gate, up = raw.chunk(2, dim=-1)
+        activated = F.silu(gate).mul_(up)
+        for branch in self.branches:
+            out = branch._residual_whole(activated, out)
+        return out
+
+    def __call__(self, x):
+        # Mirrors native H3 MLP.forward(x) in ComfyUI da8bd08. Recheck this
+        # wrapper when upstream changes the signature or residual handling.
+        raw = self.mlp.fc1(x)
+        out = comfy.ops.linear_input_act(self.mlp.fc2, raw, "swiglu")
+        # H3 packs its tokens along dim 0. Materialize SwiGLU only for the
+        # current adapter slice, after the base linear's workspace is released.
+        grad_slices = [] if out.requires_grad else None
+        for start in range(0, raw.shape[0], _FC2_SLICE_ROWS):
+            stop = start + _FC2_SLICE_ROWS
+            result = self._apply_slice(raw[start:stop], out[start:stop])
+            if grad_slices is not None:
+                grad_slices.append(result)
+        return torch.cat(grad_slices, dim=0) if grad_slices else out
+
+
 def fuse(contributions, compute_dtype):
     """Fuse contributions, retaining rank boundaries only when scheduled."""
     if all(len(item) == 3 for item in contributions):
@@ -218,8 +254,22 @@ class ScheduleController:
             self.state.clear()
 
 
-def attach(model_patcher, per_module, compute_dtype, tag: str):
-    """Build the bank, register it for VRAM accounting, and patch forwards."""
+def _supports_sliced_fc2(forward, native_forward):
+    if getattr(forward, "__func__", None) is not native_forward:
+        return False
+    try:
+        params = inspect.signature(native_forward).parameters
+    except (TypeError, ValueError):
+        return False
+    return tuple(params) == ("self", "x") and all(
+        param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+        and param.default is inspect.Parameter.empty
+        for param in params.values()
+    )
+
+
+def attach(model_patcher, per_module, compute_dtype, tag: str, notes=None):
+    """Build the bank and patch forwards. Collect fallback warnings in notes."""
     if not per_module:
         return 0, None
 
@@ -241,8 +291,33 @@ def attach(model_patcher, per_module, compute_dtype, tag: str):
     for module_path in pairs:
         forward_key = f"{module_path}.forward"
         original = model_patcher.get_model_object(forward_key)
-        model_patcher.add_object_patch(
-            forward_key, LoraBranch(bank_patcher, state, module_path, original))
+        branch = LoraBranch(bank_patcher, state, module_path, original)
+        if module_path.endswith(".mlp.fc2"):
+            weight = model_patcher.get_model_object(module_path).weight
+            if (getattr(weight, "_layout_cls", None) == "AsymW4A8Int8Layout"
+                    and hasattr(comfy.ops, "linear_input_act")):
+                from comfy.ldm.minimax.model import MLP
+
+                mlp_path = module_path.rsplit(".", 1)[0]
+                mlp_forward_key = f"{mlp_path}.forward"
+                mlp_forward = model_patcher.get_model_object(mlp_forward_key)
+                if isinstance(mlp_forward, SlicedFC2Branch):
+                    model_patcher.add_object_patch(
+                        mlp_forward_key,
+                        SlicedFC2Branch(mlp_forward.mlp, (*mlp_forward.branches, branch)))
+                    continue
+                if _supports_sliced_fc2(mlp_forward, MLP.forward):
+                    mlp = model_patcher.get_model_object(mlp_path)
+                    model_patcher.add_object_patch(mlp_forward_key, SlicedFC2Branch(mlp, (branch,)))
+                    continue
+                message = (
+                    f"{module_path} has an unrecognized MLP.forward. "
+                    "The quantized linear may bypass its LoRA branch."
+                )
+                LOG.warning("H3 Power LoRA Stack: %s", message)
+                if notes is not None:
+                    notes.append(message)
+        model_patcher.add_object_patch(forward_key, branch)
     controller = ScheduleController(state, bank.scheduled, compute_dtype) if bank.scheduled else None
     return len(pairs), controller
 
