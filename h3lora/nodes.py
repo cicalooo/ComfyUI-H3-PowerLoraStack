@@ -145,7 +145,7 @@ class H3PowerLoraStack:
                     "default": "auto",
                     "tooltip": "auto: runtime branch for quantized layers, merge for the rest. "
                                "branch: never modify a weight. merge: stock behaviour "
-                               "(destroys LoRAs on w4a8/int4).",
+                               "(destroys LoRAs on w3a8-w6a8/int4).",
                 }),
                 "adaln_port": (["auto", "strip", "off"], {
                     "default": "auto",

@@ -62,6 +62,13 @@ rank 64).
 `comfy.ops.linear_input_act`, which never calls `fc2.forward`. A branch there
 would be dropped, so those layers merge even in `branch` mode.
 
+Grouped W3A8/W4A8/W5A8/W6A8 weights use the same `AsymW4A8Int8Layout`. For those
+`mlp.fc2` layers the stack wraps the native H3 `MLP.forward`, runs the fused
+base linear once, and applies the LoRA in 512-token activation slices. If an
+`MLP.forward` wrapper is not recognized, the branch is still registered on
+`fc2.forward` for callers that reach it, and the node report warns that the
+fused path may bypass it.
+
 </details>
 
 <details>
@@ -264,6 +271,9 @@ auto-balance would have used.
   streaming loader in `minimaxh3chinkloader` uses its own handle and LoRA path.
 - DoRA, LoHa, LoKr and locon merge in `auto`; `branch` rejects them (only plain
   rank decompositions have the runtime branch path).
+- Grouped-quantized `mlp.fc2` needs the native H3 `MLP.forward` signature. A
+  custom forward wrapper is reported and may bypass the branch; `fc2.forward`
+  is still patched for callers that use it.
 
 </details>
 

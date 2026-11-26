@@ -27,6 +27,7 @@ sidecar_mod.ensure_load_hook()
 
 # Layers whose forward is bypassed by a fused kernel, per weight layout.  A
 # runtime branch on these would be silently dropped, so they must merge.
+# Grouped W3A8-W6A8 use branch.SlicedFC2Branch at the MLP boundary.
 _FORWARD_BYPASSED = {"TensorWiseINT8Layout": ("mlp.fc2",)}
 
 
@@ -413,7 +414,9 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
         while patcher.get_additional_models_with_key(f"h3_power_lora_bank_{n}"):
             n += 1
         tag = f"h3_power_lora_bank_{n}"
-        _count, controller = branch_mod.attach(patcher, per_module, compute_dtype, tag)
+        branch_notes: list[str] = []
+        _count, controller = branch_mod.attach(
+            patcher, per_module, compute_dtype, tag, notes=branch_notes)
         if controller is not None:
             patcher.add_wrapper_with_key(
                 comfy.patcher_extension.WrappersMP.APPLY_MODEL,
@@ -422,6 +425,9 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
             )
         report.add(f"branch bank: {len(per_module)} layers, "
                    f"{report.bank_bytes / (1024 ** 2):.0f} MB")
+        for note in branch_notes:
+            report.add(f"  ! {note} (counted as branched, but the fused "
+                       "path may not reach it)")
 
     if pdd_entry is not None:
         pdd_bank = pdd_entry["bank"]
